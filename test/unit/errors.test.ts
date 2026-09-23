@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EmailError, TimeoutError, classifyError, redact, registerSecret, withTimeout } from '../../src/errors.js';
+import { EmailError, TimeoutError, classifyError, providerAuthHint, redact, registerSecret, withTimeout } from '../../src/errors.js';
 
 const err = (props: Record<string, unknown>, message = 'boom') => Object.assign(new Error(message), props);
 
@@ -33,6 +33,42 @@ describe('classifyError', () => {
     expect(redact('login s3cr3t-value failed')).toBe('login *** failed');
     expect(classifyError(new Error('PASS s3cr3t-value rejected'), 'pop3').message).not.toContain('s3cr3t-value');
     expect(classifyError(new EmailError('INVALID_INPUT', 'bad s3cr3t-value')).message).not.toContain('s3cr3t-value');
+  });
+});
+
+describe('friendly messages', () => {
+  it('AUTH_FAILED carries a provider-specific hint', () => {
+    const e = classifyError(err({ code: 'EAUTH' }, '535 Login fail'), 'smtp', { host: 'smtp.qq.com', port: 465, security: 'ssl' });
+    expect(e.code).toBe('AUTH_FAILED');
+    expect(e.message).toMatch(/QQ Mail/);
+    expect(e.message).toMatch(/authorization code/);
+    expect(classifyError(err({ authenticationFailed: true }), 'imap', { host: 'imap.exmail.qq.com', port: 993, security: 'ssl' }).message).toMatch(/Tencent Exmail/);
+    expect(classifyError(err({ authenticationFailed: true }), 'imap', { host: 'mail.corp.example', port: 993, security: 'ssl' }).message).toMatch(
+      /enable IMAP\/SMTP .* authorization code \/ app password/,
+    );
+  });
+
+  it('provider hints cover the documented presets', () => {
+    expect(providerAuthHint('smtp.163.com')).toMatch(/NetEase/);
+    expect(providerAuthHint('imap.qiye.aliyun.com')).toMatch(/Aliyun/);
+    expect(providerAuthHint('outlook.office365.com')).toMatch(/app password/);
+    expect(providerAuthHint('smtp.gmail.com')).toMatch(/App Password/);
+  });
+
+  it('UNREACHABLE explains port/security mismatches and TLS problems', () => {
+    const e = classifyError(err({ code: 'ECONNREFUSED' }), 'smtp', { host: 'smtp.x.com', port: 465, security: 'starttls' });
+    expect(e.code).toBe('UNREACHABLE');
+    expect(e.message).toMatch(/SMTP_PORT=465 is unusual for SMTP_SECURE=starttls/);
+    expect(e.message).toMatch(/firewall/);
+    const t = classifyError(err({ code: 'ERR_SSL_WRONG_VERSION_NUMBER' }, 'wrong version number'), 'imap', { host: 'h', port: 143, security: 'ssl' });
+    expect(t.message).toMatch(/TLS handshake/);
+    expect(t.message).toMatch(/EMAIL_TLS_VERIFY/);
+  });
+
+  it('never includes the password', () => {
+    registerSecret('pw-in-server-reply');
+    const e = classifyError(err({ code: 'EAUTH' }, 'bad credentials pw-in-server-reply'), 'smtp', { host: 'smtp.qq.com', port: 465, security: 'ssl' });
+    expect(e.message).not.toContain('pw-in-server-reply');
   });
 });
 

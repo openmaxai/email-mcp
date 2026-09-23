@@ -52,7 +52,7 @@ export class Pop3Receiver implements Receiver {
       maxMailSize: MAX_MAIL_BYTES,
       ...sniFor(ep.host),
       // node-pop3 falls back to `host` for SNI; explicitly unset it for IP hosts (RFC 6066).
-      tlsOptions: { rejectUnauthorized: cfg.tlsRejectUnauthorized, servername: sniFor(ep.host).servername } as TlsOptions,
+      tlsOptions: { rejectUnauthorized: cfg.tlsVerify, servername: sniFor(ep.host).servername } as TlsOptions,
     });
     // Late socket errors must never become unhandled 'error' events.
     c.on('error', () => {});
@@ -71,7 +71,7 @@ export class Pop3Receiver implements Receiver {
       return r;
     } catch (err) {
       if (err instanceof EmailError) throw err;
-      throw classifyError(err, 'pop3');
+      throw classifyError(err, 'pop3', this.ep);
     } finally {
       if (ok) await withTimeout(c.QUIT(), 5000, 'POP3 QUIT', destroy).catch(destroy);
       else destroy();
@@ -140,6 +140,7 @@ export class Pop3Receiver implements Receiver {
       return detailFromParsed(p.uid, 'INBOX', mail, [], null, {
         format: p.format,
         includeAttachments: p.includeAttachments,
+        maxAttachmentBytes: this.cfg.maxAttachmentBytes,
       });
     });
   }

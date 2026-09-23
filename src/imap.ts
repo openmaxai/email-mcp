@@ -18,6 +18,19 @@ import type {
   SearchParams,
 } from './receiver.js';
 
+export const SENT_NAMES = ['Sent', 'Sent Messages', 'Sent Items', '已发送', '已发送邮件'];
+
+/** Choose the Sent folder: SPECIAL-USE \\Sent, else the first common name (path or leaf name, case-insensitive). */
+export function pickSentFolder(boxes: { path: string; name: string; specialUse?: string; flags?: Set<string> }[]): string | undefined {
+  const special = boxes.find((b) => b.specialUse === '\\Sent' || b.flags?.has('\\Sent'));
+  if (special) return special.path;
+  for (const n of SENT_NAMES) {
+    const hit = boxes.find((b) => b.path.toLowerCase() === n.toLowerCase() || b.name.toLowerCase() === n.toLowerCase());
+    if (hit) return hit.path;
+  }
+  return undefined;
+}
+
 /** Bytes of the raw message fetched for list/search summaries (headers + start of body). */
 const SUMMARY_BYTES = 16 * 1024;
 
@@ -56,7 +69,7 @@ export class ImapReceiver implements Receiver, ImapExtras {
       secure: ep.security === 'ssl',
       doSTARTTLS: ep.security === 'starttls' ? true : ep.security === 'none' ? false : undefined,
       auth: { user: cfg.user, pass: cfg.password },
-      tls: { rejectUnauthorized: cfg.tlsRejectUnauthorized, ...sniFor(ep.host) },
+      tls: { rejectUnauthorized: cfg.tlsVerify, ...sniFor(ep.host) },
       logger: false,
       disableAutoIdle: true,
       connectionTimeout: cfg.timeoutMs,
@@ -84,7 +97,7 @@ export class ImapReceiver implements Receiver, ImapExtras {
       );
     } catch (err) {
       if (err instanceof EmailError) throw err;
-      throw classifyError(err, 'imap');
+      throw classifyError(err, 'imap', this.ep);
     } finally {
       if (client.usable) {
         await withTimeout(client.logout(), 5000, 'IMAP logout', hardClose).catch(hardClose);
@@ -180,6 +193,7 @@ export class ImapReceiver implements Receiver, ImapExtras {
         return detailFromParsed(String(uid), p.folder, parsed, flags, flags.includes('\\Seen'), {
           format: p.format,
           includeAttachments: p.includeAttachments,
+          maxAttachmentBytes: this.cfg.maxAttachmentBytes,
         });
       }),
     );
@@ -200,6 +214,23 @@ export class ImapReceiver implements Receiver, ImapExtras {
         return originalFromParsed(await parse(m.source!));
       }),
     );
+  }
+
+  /**
+   * APPEND a copy of a sent message to the Sent folder, marked \\Seen.
+   * Folder detection: SPECIAL-USE \\Sent first, then common names.
+   */
+  async appendToSent(raw: Buffer): Promise<string> {
+    return this.withClient('save to Sent', async (c) => {
+      const boxes = await c.list();
+      const target = pickSentFolder(boxes);
+      if (!target) {
+        throw new EmailError('NOT_FOUND', `No Sent folder found (no \\Sent special-use folder and none named ${SENT_NAMES.join(' / ')})`);
+      }
+      const r = await c.append(target, raw, ['\\Seen']);
+      if (!r) throw new EmailError('UNKNOWN', `IMAP APPEND to "${target}" was not accepted`);
+      return target;
+    });
   }
 
   async listFolders(): Promise<FolderInfo[]> {

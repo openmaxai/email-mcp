@@ -39,16 +39,22 @@ Any other MCP client works the same way: run `npx -y @openmaxai/email-mcp` with 
 | `RECEIVE_PROTOCOL` | no | `imap` | `imap` or `pop3`. |
 | `IMAP_HOST` | if imap | | |
 | `IMAP_PORT` | no | 993 (ssl) / 143 | |
-| `IMAP_SECURE` | no | `ssl` | `ssl` (implicit TLS), `starttls`, or `none`. |
+| `IMAP_SECURE` | no | from port, else `ssl` | `ssl` (implicit TLS), `starttls`, or `none`. |
 | `POP3_HOST` | if pop3 | | |
 | `POP3_PORT` | no | 995 (ssl) / 110 | |
-| `POP3_SECURE` | no | `ssl` | `ssl` or `none` (STARTTLS is not supported for POP3). |
+| `POP3_SECURE` | no | from port, else `ssl` | `ssl` or `none` (STARTTLS is not supported for POP3). |
 | `SMTP_HOST` | yes | | |
 | `SMTP_PORT` | no | 465 (ssl) / 587 (starttls) / 25 (none) | |
-| `SMTP_SECURE` | no | `ssl` | `ssl`, `starttls`, or `none`. |
-| `EMAIL_TLS_REJECT_UNAUTHORIZED` | no | `true` | Set to `false` only for servers with self-signed certificates. |
+| `SMTP_SECURE` | no | from port, else `ssl` | `ssl`, `starttls`, or `none`. |
+| `EMAIL_TLS_VERIFY` | no | `true` | Verify server TLS certificates. Set to `false` only for servers with self-signed certificates. |
+| `EMAIL_SAVE_SENT` | no | `true` | IMAP only: after sending, save a copy (marked read, Bcc kept) to the Sent folder. |
+| `EMAIL_ATTACHMENT_ROOTS` | no | working directory + OS temp dir | Directories that attachments may be read from, separated by `:` (`;` on Windows). |
+| `EMAIL_MAX_ATTACHMENT_MB` | no | `25` | Size limit for each attachment and for the total per message. `get_email` also skips saving attachments above it. |
+| `EMAIL_ALIASES` | no | | Other addresses of this mailbox, comma-separated. Excluded from reply-all recipients. |
 | `EMAIL_TIMEOUT_MS` | no | `30000` | Timeout for each tool call's network work (1000 to 600000). |
 | `EMAIL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, or `error` (stderr). |
+
+**Security from the port.** If `*_SECURE` is not set but `*_PORT` is, the security mode follows the port: SMTP 465 is `ssl`, 587 and 25 are `starttls`; IMAP 993 is `ssl`, 143 is `starttls`; POP3 995 is `ssl`. Other ports default to `ssl`. POP3 on port 110 is plaintext, so it needs an explicit `POP3_SECURE=none`. An explicit `*_SECURE` always wins.
 
 `starttls` requires the upgrade: the connection fails if the server does not offer STARTTLS. `none` sends credentials in plaintext and logs a warning; use it only for local test servers.
 
@@ -73,8 +79,8 @@ Provider settings can change. Check the provider's help pages if a connection fa
 
 | Tool | Available | Description |
 |---|---|---|
-| `send_email` | always | `to[]`, `cc[]`, `bcc[]`, `subject`, `text`, `html`, `attachments[]` (local file paths; 25 MB total). |
-| `reply_email` | always | Reply to a message by `uid` or `message_id` (and `folder`). Sets `In-Reply-To` / `References`, adds `Re:` to the subject, and supports `reply_all`. |
+| `send_email` | always | `to[]`, `cc[]`, `bcc[]`, `subject`, `text`, `html`, `attachments[]` (local file paths under the allowed directories). Under IMAP the result includes `saved_to_sent`, or `warnings` if the Sent copy failed. The send itself still succeeds in that case. |
+| `reply_email` | always | Reply to a message by `uid` or `message_id` (and `folder`). Sets `In-Reply-To` / `References` and adds `Re:` to the subject. The reply goes to Reply-To if present, otherwise From. `reply_all` also adds the original To/Cc, removing duplicates and your own addresses (`EMAIL_USER` and `EMAIL_ALIASES`). |
 | `list_emails` | always | `folder` (default `INBOX`), `limit` (1–100, default 20), `unread_only`. Returns summaries, newest first: `uid`, `message_id`, `from`, `to`, `subject`, `date`, `flags`, `seen`, `snippet`. |
 | `get_email` | always | `uid`, `folder`, `format` (`full` or `headers`), `include_attachments`. Attachments are saved to a private temp directory (mode 0600) and their paths are returned. Bodies longer than 100k characters are truncated and flagged. |
 | `search_emails` | always | `from`, `to`, `subject`, `text`, `since`, `before` (YYYY-MM-DD; `since` inclusive, `before` exclusive), `folder`, `limit`. |
@@ -82,6 +88,8 @@ Provider settings can change. Check the provider's help pages if a connection fa
 | `mark_read` | IMAP only | `uid`, `folder`, `read` (true sets `\Seen`, false clears it). |
 
 Reading a message never marks it as read. Use `mark_read` to do that.
+
+**Sent folder.** The Sent folder is found through IMAP SPECIAL-USE `\Sent`. If the server doesn't advertise one, the first folder named `Sent`, `Sent Messages`, `Sent Items`, `已发送` or `已发送邮件` is used. If none of these exists, no folder is created and the result carries a warning.
 
 ### POP3 limitations
 
@@ -97,8 +105,8 @@ Failed tool calls return `isError: true` with a JSON body `{"error": {"code", "m
 
 | Code | Meaning |
 |---|---|
-| `AUTH_FAILED` | Wrong user/password, IMAP/SMTP not enabled, or an authorization code is required. |
-| `UNREACHABLE` | DNS failure, connection refused or reset, or a TLS/certificate problem. |
+| `AUTH_FAILED` | Wrong user/password, IMAP/SMTP not enabled, or an authorization code is required. The message includes a hint for the provider, detected from the host name. |
+| `UNREACHABLE` | DNS failure, connection refused or reset, or a TLS/certificate problem. The message suggests port/security fixes. |
 | `SEND_REJECTED` | The SMTP server rejected the recipients or the message. |
 | `NOT_FOUND` | No such message (uid / Message-ID) or folder. |
 | `INVALID_INPUT` | Bad arguments, for example a missing body, an unreadable attachment or a bad date. |
@@ -109,7 +117,7 @@ Failed tool calls return `isError: true` with a JSON body `{"error": {"code", "m
 
 - The only secret is `EMAIL_PASSWORD`. It is removed from every error message and log line.
 - TLS certificates are verified by default.
-- The server can attach **any local file the process can read** when an agent asks it to. Run it with a user account whose file access you are comfortable with.
+- Attachments can only be read from the allowed directories: the working directory and the OS temp dir, or `EMAIL_ATTACHMENT_ROOTS`. Paths are resolved with `realpath`, so `../` traversal and symlinks that point outside those directories are rejected.
 - Message bodies, subjects and addresses are never written to logs.
 
 ## Development

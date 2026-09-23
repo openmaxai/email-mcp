@@ -88,7 +88,60 @@ function isTlsProblem(code: string, msg: string): boolean {
  * Map an arbitrary library error to a stable error code.
  * `stage` helps disambiguate errors from libraries with weak error typing.
  */
-export function classifyError(err: unknown, stage: 'smtp' | 'imap' | 'pop3' | 'other' = 'other'): EmailError {
+export interface ErrorContext {
+  host: string;
+  port: number;
+  security: 'ssl' | 'starttls' | 'none';
+}
+
+interface ProviderHint {
+  match: RegExp;
+  name: string;
+  auth: string;
+}
+
+/** Provider-specific guidance, matched on the configured server host name. */
+const PROVIDERS: ProviderHint[] = [
+  { match: /(^|\.)exmail\.qq\.com$/i, name: 'Tencent Exmail', auth: 'enable IMAP/SMTP in the mailbox client settings; if secure login is on, use a client-specific password (客户端专用密码).' },
+  { match: /(^|\.)qq\.com$/i, name: 'QQ Mail', auth: 'in QQ Mail Settings > Account, enable the IMAP/SMTP (or POP3/SMTP) service and use the generated authorization code (授权码), not your QQ password.' },
+  { match: /(^|\.)(163|126|yeah)\.net$|(^|\.)(163|126)\.com$/i, name: 'NetEase Mail', auth: 'in Settings > POP3/SMTP/IMAP, enable the service and use the authorization code (授权码), not your login password.' },
+  { match: /(^|\.)aliyun\.com$|(^|\.)mxhichina\.com$/i, name: 'Aliyun Mail', auth: 'make sure the administrator allows IMAP/POP/SMTP for your account, and use a third-party client password if one is required.' },
+  { match: /(^|\.)(office365|outlook)\.com$/i, name: 'Outlook / Microsoft 365', auth: 'use an app password (requires 2-step verification). Many Microsoft 365 tenants disable basic authentication for IMAP/POP/SMTP entirely; this server does not support OAuth.' },
+  { match: /(^|\.)gmail\.com$|(^|\.)googlemail\.com$/i, name: 'Gmail', auth: 'turn on 2-Step Verification, create an App Password, and enable IMAP in Gmail settings.' },
+];
+
+const GENERIC_AUTH_HINT =
+  'Most providers require you to enable IMAP/SMTP (or POP3/SMTP) in the mailbox settings and to use an authorization code / app password instead of the normal login password.';
+
+export function providerAuthHint(host: string | undefined): string {
+  const p = host ? PROVIDERS.find((x) => x.match.test(host)) : undefined;
+  return p ? `${p.name}: ${p.auth}` : GENERIC_AUTH_HINT;
+}
+
+const STANDARD_PORTS: Record<string, Record<string, number[]>> = {
+  imap: { ssl: [993], starttls: [143], none: [143] },
+  pop3: { ssl: [995], starttls: [110], none: [110] },
+  smtp: { ssl: [465], starttls: [587, 25], none: [25, 587] },
+};
+
+function unreachableHint(stage: string, ctx: ErrorContext | undefined, tls: boolean): string {
+  if (!ctx) return '';
+  const hints: string[] = [];
+  const P = stage.toUpperCase();
+  const std = STANDARD_PORTS[stage]?.[ctx.security];
+  if (std && !std.includes(ctx.port)) {
+    hints.push(`${P}_PORT=${ctx.port} is unusual for ${P}_SECURE=${ctx.security} (usually ${std.join(' or ')}); check that port and security match`);
+  }
+  if (tls) hints.push(`TLS handshake/certificate problem: check ${P}_SECURE (ssl vs starttls) and ${P}_PORT; set EMAIL_TLS_VERIFY=false only for self-signed test servers`);
+  hints.push(`verify ${P}_HOST=${ctx.host} is correct and that outbound port ${ctx.port} is not blocked by a firewall`);
+  return ` Hints: ${hints.join('; ')}.`;
+}
+
+export function classifyError(
+  err: unknown,
+  stage: 'smtp' | 'imap' | 'pop3' | 'other' = 'other',
+  ctx?: ErrorContext,
+): EmailError {
   if (err instanceof EmailError) return new EmailError(err.code, redact(err.message));
 
   const e = (typeof err === 'object' && err !== null ? err : { message: String(err) }) as AnyErr;
@@ -112,13 +165,16 @@ export function classifyError(err: unknown, stage: 'smtp' | 'imap' | 'pop3' | 'o
   ) {
     return new EmailError(
       'AUTH_FAILED',
-      `Authentication failed (${stage.toUpperCase()}). Check EMAIL_USER and EMAIL_PASSWORD; most providers require IMAP/POP3/SMTP to be enabled and an app password / authorization code instead of the login password. Server said: ${msg}`,
+      `${stage.toUpperCase()} login was rejected for EMAIL_USER. Check EMAIL_USER and EMAIL_PASSWORD. ${providerAuthHint(ctx?.host)} Server said: ${msg}`,
     );
   }
 
   // --- timeouts ---
   if (TIMEOUT_CODES.has(code) || TIMEOUT_CODES.has(causeCode) || (stage === 'pop3' && e.eventName === 'timeout')) {
-    return new EmailError('TIMEOUT', `${stage.toUpperCase()} operation timed out: ${msg}`);
+    return new EmailError(
+      'TIMEOUT',
+      `${stage.toUpperCase()} server did not respond in time: ${msg}.${ctx ? ` Check ${stage.toUpperCase()}_HOST/${stage.toUpperCase()}_PORT (${ctx.host}:${ctx.port}) and ${stage.toUpperCase()}_SECURE=${ctx.security}; a wrong ssl/starttls choice often looks like a hang.` : ''}`,
+    );
   }
 
   // --- SMTP rejection ---
@@ -131,13 +187,14 @@ export function classifyError(err: unknown, stage: 'smtp' | 'imap' | 'pop3' | 'o
 
   // --- network / TLS ---
   if (NET_UNREACHABLE.has(code) || NET_UNREACHABLE.has(causeCode) || isTlsProblem(code || causeCode, rawMsg)) {
-    const tlsHint = isTlsProblem(code || causeCode, rawMsg)
-      ? ' (TLS problem: check *_SECURE / *_PORT, or EMAIL_TLS_REJECT_UNAUTHORIZED for self-signed servers)'
-      : '';
-    return new EmailError('UNREACHABLE', `Cannot reach ${stage.toUpperCase()} server${tlsHint}: ${code ? code + ' ' : ''}${msg}`);
+    const tls = isTlsProblem(code || causeCode, rawMsg);
+    return new EmailError(
+      'UNREACHABLE',
+      `Cannot connect to the ${stage.toUpperCase()} server${ctx ? ` ${ctx.host}:${ctx.port}` : ''}: ${code ? code + ' ' : ''}${msg}.${unreachableHint(stage, ctx, tls)}`,
+    );
   }
   if (stage === 'pop3' && (e.eventName === 'close' || e.eventName === 'end' || e.eventName === 'bad-server-response' || rawMsg === 'no-socket')) {
-    return new EmailError('UNREACHABLE', `POP3 connection closed unexpectedly: ${msg}`);
+    return new EmailError('UNREACHABLE', `POP3 connection closed unexpectedly: ${msg}.${unreachableHint(stage, ctx, false)}`);
   }
 
   return new EmailError('UNKNOWN', `${stage === 'other' ? '' : stage.toUpperCase() + ' '}error: ${code ? code + ' ' : ''}${msg}`);

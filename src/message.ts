@@ -28,6 +28,8 @@ export interface AttachmentInfo {
   content_type: string;
   size: number;
   path?: string;
+  /** Set when include_attachments was requested but the file was not saved. */
+  skipped_reason?: string;
 }
 
 export interface EmailDetail {
@@ -39,6 +41,8 @@ export interface EmailDetail {
   from: Address[];
   to: Address[];
   cc: Address[];
+  /** Only present on your own copies (e.g. in the Sent folder). */
+  bcc?: Address[];
   reply_to: Address[];
   subject: string;
   date?: string;
@@ -151,7 +155,7 @@ export async function detailFromParsed(
   mail: ParsedMail,
   flags: string[],
   seen: boolean | null,
-  opts: { format: 'full' | 'headers'; includeAttachments: boolean },
+  opts: { format: 'full' | 'headers'; includeAttachments: boolean; maxAttachmentBytes?: number },
 ): Promise<EmailDetail> {
   const d: EmailDetail = {
     uid,
@@ -165,6 +169,7 @@ export async function detailFromParsed(
     reply_to: flattenAddresses(mail.replyTo),
     subject: mail.subject ?? '',
     date: mail.date?.toISOString(),
+    ...(mail.bcc ? { bcc: flattenAddresses(mail.bcc) } : {}),
     flags,
     seen,
     attachments: (mail.attachments ?? []).map((a, i) => ({
@@ -186,6 +191,10 @@ export async function detailFromParsed(
     const used = new Set<string>();
     for (let i = 0; i < mail.attachments.length; i++) {
       const a = mail.attachments[i];
+      if (opts.maxAttachmentBytes !== undefined && a.size > opts.maxAttachmentBytes) {
+        d.attachments[i].skipped_reason = `larger than the ${opts.maxAttachmentBytes} byte limit (EMAIL_MAX_ATTACHMENT_MB)`;
+        continue;
+      }
       let name = safeFilename(a.filename, i);
       if (used.has(name)) name = `${i + 1}-${name}`;
       used.add(name);
@@ -226,11 +235,13 @@ function fmt(a: Address): string {
  */
 export function buildReplyHeaders(
   orig: OriginalForReply,
-  self: string,
+  self: string | string[],
   replyAll: boolean,
 ): { to: string[]; cc: string[]; subject: string; inReplyTo?: string; references: string[] } {
-  const me = self.toLowerCase();
-  const primary = (orig.replyTo.length ? orig.replyTo : orig.from).filter((a) => a.address);
+  const mine = new Set((Array.isArray(self) ? self : [self]).map((a) => a.toLowerCase()));
+  const isMine = (a: Address) => mine.has((a.address ?? '').toLowerCase());
+  // Reply-To wins over From (mailing lists, ticket systems, "reply to my other address").
+  const primary = (orig.replyTo.some((a) => a.address) ? orig.replyTo : orig.from).filter((a) => a.address);
   const seen = new Set<string>();
   const pick = (list: Address[]) => {
     const out: string[] = [];
@@ -244,8 +255,8 @@ export function buildReplyHeaders(
   };
   // If I sent the original, reply to its recipients instead of myself.
   let toList = primary;
-  if (primary.every((a) => a.address?.toLowerCase() === me) && orig.to.length) toList = orig.to;
-  seen.add(me);
+  if (primary.length && primary.every(isMine) && orig.to.length) toList = orig.to;
+  for (const m of mine) seen.add(m);
   const to = pick(toList);
   const cc = replyAll ? pick([...orig.to, ...orig.cc]) : [];
   const references = [...orig.references];

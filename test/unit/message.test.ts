@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_BODY_CHARS,
   buildReplyHeaders,
   detailFromParsed,
   makeSnippet,
@@ -73,6 +74,21 @@ describe('parsing helpers', () => {
     expect(d.attachments[0].path).toBeUndefined();
   });
 
+  it('skips saving attachments above the size limit, with a reason', async () => {
+    const d = await detailFromParsed('7', 'INBOX', await parse(RAW), [], false, { format: 'full', includeAttachments: true, maxAttachmentBytes: 3 });
+    expect(d.attachments[0].path).toBeUndefined();
+    expect(d.attachments[0].skipped_reason).toMatch(/EMAIL_MAX_ATTACHMENT_MB/);
+  });
+
+  it('truncates very large bodies and flags it', async () => {
+    const big = `Subject: big\r\nContent-Type: text/plain\r\n\r\n${'a'.repeat(MAX_BODY_CHARS + 50)}\r\n`;
+    const d = await detailFromParsed('1', 'INBOX', await parse(big), [], false, { format: 'full', includeAttachments: false });
+    expect(d.text!.length).toBe(MAX_BODY_CHARS);
+    expect(d.text_truncated).toBe(true);
+    const small = await detailFromParsed('1', 'INBOX', await parse(RAW), [], false, { format: 'full', includeAttachments: false });
+    expect(small.text_truncated).toBeUndefined();
+  });
+
   it('makeSnippet truncates and collapses whitespace', () => {
     expect(makeSnippet('a\n\n b', 10)).toBe('a b');
     expect(makeSnippet('x'.repeat(300)).length).toBe(201);
@@ -122,6 +138,23 @@ describe('reply headers', () => {
   it('prefers Reply-To', () => {
     const h = buildReplyHeaders({ ...orig, replyTo: [{ address: 'list@example.com' }] }, 'me@example.com', false);
     expect(h.to).toEqual(['list@example.com']);
+  });
+
+  it('excludes every own address (aliases) from reply-all and dedups case-insensitively', () => {
+    const o: OriginalForReply = {
+      ...orig,
+      replyTo: [{ address: 'Alice@Example.com' }],
+      to: [{ address: 'alias@example.com' }, { address: 'carol@example.com' }, { address: 'CAROL@example.com' }],
+      cc: [{ address: 'me@example.com' }, { address: 'alice@example.com' }, { address: 'dave@example.com' }],
+    };
+    const h = buildReplyHeaders(o, ['me@example.com', 'alias@example.com'], true);
+    expect(h.to).toEqual(['Alice@Example.com']);
+    expect(h.cc).toEqual(['carol@example.com', 'dave@example.com']);
+  });
+
+  it('falls back to From when Reply-To is empty or has no address', () => {
+    const h = buildReplyHeaders({ ...orig, replyTo: [{ name: 'nobody' }] }, 'me@example.com', false);
+    expect(h.to).toEqual(['"Alice" <alice@example.com>']);
   });
 
   it('replying to my own sent message targets its recipients', () => {

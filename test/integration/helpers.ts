@@ -9,6 +9,9 @@ export const USERS = {
   alice: { user: 'alice@example.com', password: 'alicepw' },
   bob: { user: 'bob@example.com', password: 'bobpw' },
   carol: { user: 'carol@example.com', password: 'carolpw' },
+  dave: { user: 'dave@example.com', password: 'davepw' },
+  erin: { user: 'erin@example.com', password: 'erinpw' },
+  frank: { user: 'frank@example.com', password: 'frankpw' },
 };
 
 export type Mode = 'plain' | 'ssl';
@@ -27,7 +30,7 @@ export function envFor(
     SMTP_HOST: gm.host,
     SMTP_PORT: String(ssl ? gm.smtps : gm.smtp),
     SMTP_SECURE: ssl ? 'ssl' : 'none',
-    EMAIL_TLS_REJECT_UNAUTHORIZED: 'false', // GreenMail uses a self-signed certificate
+    EMAIL_TLS_VERIFY: 'false', // GreenMail uses a self-signed certificate
     EMAIL_TIMEOUT_MS: '15000',
   };
   if (protocol === 'imap') {

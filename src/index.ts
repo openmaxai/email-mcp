@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   for (const [name, ep] of [['IMAP', cfg.imap], ['POP3', cfg.pop3], ['SMTP', cfg.smtp]] as const) {
     if (ep?.security === 'none') log.warn(`${name}_SECURE=none: credentials and mail are sent in plaintext`);
   }
-  if (!cfg.tlsRejectUnauthorized) log.warn('EMAIL_TLS_REJECT_UNAUTHORIZED=false: TLS certificates are not verified');
+  if (!cfg.tlsVerify) log.warn('EMAIL_TLS_VERIFY=false: TLS certificates are not verified');
 
   const server = createServer(cfg);
   await server.connect(new StdioServerTransport());

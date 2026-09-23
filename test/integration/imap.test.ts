@@ -204,7 +204,7 @@ describe('IMAPS + SMTPS (implicit TLS)', () => {
   });
 
   it('rejects the self-signed certificate by default (UNREACHABLE)', async () => {
-    const h = await connect(envFor('bob', { mode: 'ssl', overrides: { EMAIL_TLS_REJECT_UNAUTHORIZED: 'true' } }));
+    const h = await connect(envFor('bob', { mode: 'ssl', overrides: { EMAIL_TLS_VERIFY: 'true' } }));
     try {
       const r = await h.call('list_emails');
       expect(r.isError).toBe(true);

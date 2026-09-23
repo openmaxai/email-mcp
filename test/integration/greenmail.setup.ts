@@ -83,7 +83,7 @@ export async function setup(project: TestProject): Promise<void> {
     const opts = [
       '-Dgreenmail.setup.test.all',
       '-Dgreenmail.hostname=0.0.0.0',
-      '-Dgreenmail.users=alice:alicepw@example.com,bob:bobpw@example.com,carol:carolpw@example.com',
+      '-Dgreenmail.users=alice:alicepw@example.com,bob:bobpw@example.com,carol:carolpw@example.com,dave:davepw@example.com,erin:erinpw@example.com,frank:frankpw@example.com',
       '-Dgreenmail.users.login=email',
     ].join(' ');
     const args = ['run', '-d', '--rm', '--name', containerName, '-e', `GREENMAIL_OPTS=${opts}`];

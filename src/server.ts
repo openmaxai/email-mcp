@@ -8,7 +8,7 @@ import { log } from './logger.js';
 import { buildReplyHeaders } from './message.js';
 import { Pop3Receiver } from './pop3.js';
 import type { Receiver } from './receiver.js';
-import { sendMail } from './smtp.js';
+import { sendMail, type OutgoingMessage } from './smtp.js';
 
 export const VERSION = '0.1.0';
 
@@ -25,7 +25,7 @@ const attachmentsSchema = z
   .array(z.string().min(1))
   .max(20)
   .optional()
-  .describe('Local file paths to attach (resolved against the server working directory)');
+  .describe('Local file paths to attach. Only files under the allowed directories (working directory and the temp dir by default) can be attached.');
 
 function ok(data: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -63,6 +63,30 @@ function requireBody(text?: string, html?: string): void {
   if (!text && !html) throw new EmailError('INVALID_INPUT', 'Provide at least one of "text" or "html"');
 }
 
+/**
+ * Send, then (IMAP + EMAIL_SAVE_SENT) append a copy to Sent.
+ * A failed append never fails the send: it is reported in `warnings`.
+ */
+async function sendAndSave(cfg: Config, receiver: Receiver, msg: OutgoingMessage) {
+  const wantCopy = cfg.saveSent && receiver instanceof ImapReceiver;
+  const { result, raw } = await sendMail(cfg, msg, { buildCopy: wantCopy });
+  const out: Record<string, unknown> = { ...result };
+  if (wantCopy) {
+    if (!raw) {
+      out.warnings = ['Sent successfully, but a copy could not be built for the Sent folder.'];
+    } else {
+      try {
+        out.saved_to_sent = await (receiver as ImapReceiver).appendToSent(raw);
+      } catch (err) {
+        const e = classifyError(err, 'imap');
+        log.warn(`save to Sent failed: ${e.code}`);
+        out.warnings = [`Sent successfully, but saving a copy to the Sent folder failed (${e.code}): ${e.message}`];
+      }
+    }
+  }
+  return out;
+}
+
 export function createReceiver(cfg: Config): Receiver {
   return cfg.receiveProtocol === 'pop3' ? new Pop3Receiver(cfg) : new ImapReceiver(cfg);
 }
@@ -76,7 +100,9 @@ export function createServer(cfg: Config, receiver: Receiver = createReceiver(cf
     'send_email',
     {
       title: 'Send email',
-      description: `Send an email via SMTP from ${cfg.user}. Recipients accept "addr@example.com" or "Name <addr@example.com>".`,
+      description: `Send an email via SMTP from ${cfg.user}. Recipients accept "addr@example.com" or "Name <addr@example.com>".${
+        cfg.saveSent && cfg.receiveProtocol === 'imap' ? ' A copy is saved to the IMAP Sent folder.' : ''
+      }`,
       inputSchema: {
         to: addressList.min(1).describe('Recipient addresses'),
         cc: addressList.optional(),
@@ -90,7 +116,7 @@ export function createServer(cfg: Config, receiver: Receiver = createReceiver(cf
     async (a) =>
       run('send_email', async () => {
         requireBody(a.text, a.html);
-        return sendMail(cfg, {
+        return sendAndSave(cfg, receiver, {
           to: a.to,
           cc: a.cc,
           bcc: a.bcc,
@@ -131,10 +157,10 @@ export function createServer(cfg: Config, receiver: Receiver = createReceiver(cf
           messageId: a.message_id,
           folder: a.folder,
         });
-        const h = buildReplyHeaders(orig, cfg.user, a.reply_all);
+        const h = buildReplyHeaders(orig, cfg.ownAddresses, a.reply_all);
         if (!h.to.length) throw new EmailError('INVALID_INPUT', 'Original message has no usable sender address to reply to');
         const cc = [...h.cc, ...(a.cc ?? [])];
-        const res = await sendMail(cfg, {
+        const res = await sendAndSave(cfg, receiver, {
           to: h.to,
           cc,
           bcc: a.bcc,
