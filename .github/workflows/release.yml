@@ -10,18 +10,23 @@ permissions:
 
 # Serialize releases: two tag runs must never interleave their publish /
 # dist-tag steps. cancel-in-progress: false so a running publish is never
-# killed midway. NOTE: GitHub keeps at most ONE pending run per group — if a
-# third tag is pushed while one runs and one waits, the waiting one is
-# cancelled and must be re-run manually (the job below is safe to re-run).
+# killed midway. queue: max keeps up to 100 pending runs FIFO instead of the
+# default single pending slot (which would silently cancel an older pending
+# run -- e.g. one waiting for `release` environment approval -- when a newer
+# tag is pushed). See docs.github.com workflow-syntax `concurrency.queue`.
 concurrency:
   group: release-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Every step below has its own timeout-minutes whose sum stays under this
+    # job limit, so a hung step fails on its own and the `if: always()`
+    # cleanup / reporting steps at the end still get to run.
+    timeout-minutes: 45
     # Defense-in-depth: gate publishes behind a protected environment. Configure
     # required reviewers + a deployment tag policy on the `release` environment
     # (Settings > Environments) so every publish needs a human approval.
@@ -29,34 +34,56 @@ jobs:
     permissions:
       contents: read
       id-token: write # required for npm provenance
+    env:
+      # Neutral dist-tag the new version is published under before the
+      # monotonic guard decides whether alpha/latest move (see below).
+      HOLD_TAG: publish-staging
     steps:
       # Actions pinned to full commit SHAs (not mutable @v4 tags): this is a
       # privileged job (id-token: write + npm token), so the supply chain must
       # be immutable. Bump SHAs via a reviewed PR.
       - name: Checkout tagged commit (full history for ancestry check)
+        timeout-minutes: 3
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
+      # EXPECTED_SHA = the tag PEELED to its commit. For an annotated tag the
+      # tag object's sha differs from the commit sha; npm's provenance
+      # predicate (resolvedDependencies[].digest.gitCommit), the Fulcio cert
+      # and the registry gitHead all record the commit. So never compare
+      # against raw $GITHUB_SHA: every check below uses EXPECTED_SHA.
+      #
       # SECURITY GATE: only code that was merged through the protected-main
       # review gate may be published. A v* tag on any other commit (e.g. an
       # unmerged PR head, which can already carry a real version string) is
       # refused here — the branch ruleset alone does NOT protect tags.
-      - name: Verify tagged commit is contained in protected main
+      - name: Resolve tagged commit and verify it is contained in protected main
+        timeout-minutes: 2
         run: |
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          rc=0
-          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || rc=$?
-          if [ "$rc" -eq 1 ]; then
-            echo "::error::Refusing to publish ${GITHUB_REF_NAME}: commit ${GITHUB_SHA} is NOT contained in protected origin/main. Only commits merged through the main review gate can be released."
-            exit 1
-          elif [ "$rc" -ne 0 ]; then
-            echo "::error::Ancestry check failed with git error (rc=$rc) for ${GITHUB_SHA} vs origin/main; refusing to publish. This is NOT an ancestry verdict: check the fetch / history depth."
+          set -euo pipefail
+          EXPECTED_SHA="$(git rev-parse --verify "${GITHUB_REF}^{commit}")"
+          HEAD_SHA="$(git rev-parse --verify HEAD)"
+          echo "tag ${GITHUB_REF} -> commit ${EXPECTED_SHA} (GITHUB_SHA=${GITHUB_SHA}, HEAD=${HEAD_SHA})"
+          if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked-out HEAD ${HEAD_SHA} is not the commit ${GITHUB_REF} points at (${EXPECTED_SHA}); refusing."
             exit 1
           fi
-          echo "OK: ${GITHUB_SHA} is contained in protected main."
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          rc=0
+          git merge-base --is-ancestor "$EXPECTED_SHA" refs/remotes/origin/main || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::Refusing to publish ${GITHUB_REF_NAME}: commit ${EXPECTED_SHA} is NOT contained in protected origin/main. Only commits merged through the main review gate can be released."
+            exit 1
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::Ancestry check failed with git error (rc=$rc) for ${EXPECTED_SHA} vs origin/main; refusing to publish. This is NOT an ancestry verdict: check the fetch / history depth."
+            exit 1
+          fi
+          echo "OK: ${EXPECTED_SHA} is contained in protected main."
+          echo "EXPECTED_SHA=$EXPECTED_SHA" >> "$GITHUB_ENV"
 
       - name: Setup Node
+        timeout-minutes: 3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
@@ -64,15 +91,18 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
+        timeout-minutes: 5
         run: npm ci
 
       - name: Typecheck, unit tests, build
+        timeout-minutes: 6
         run: |
           npm run typecheck
           npm test
           npm run build
 
       - name: Verify git tag matches package.json version
+        timeout-minutes: 1
         run: |
           PKG_VERSION="$(node -p "require('./package.json').version")"
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -85,80 +115,101 @@ jobs:
       # ------------------------------------------------------------------
       # Publish + dist-tags, designed to be RE-RUNNABLE (convergent):
       #
-      #  1. Plan: if NAME@VERSION already exists on the registry, it must be
-      #     THIS build (registry gitHead == checked-out commit; npm records
-      #     gitHead from .git/HEAD on publish). Match -> skip publish (safe
-      #     re-run after a later step failed). Mismatch / no gitHead -> fail.
-      #  2. Publish under a neutral holding dist-tag ($HOLD_TAG), never
-      #     directly under alpha/latest: `npm publish --tag X` always moves X,
-      #     which would bypass the monotonic guard below.
-      #  3. Move the channel tag(s) with `npm dist-tag add` ONLY if VERSION is
+      #  1. Plan: decide whether NAME@VERSION exists by querying `version`
+      #     (E404 -> absent; exact version -> present; anything else -> fail).
+      #     If present, its gitHead must equal EXPECTED_SHA (empty gitHead ->
+      #     fail); a match means "re-run after a later step failed" and the
+      #     publish is skipped. gitHead is plaintext, so it is only a cheap
+      #     pre-filter -- step 3 is the real proof.
+      #  2. Publish (only if absent) under a neutral holding dist-tag
+      #     ($HOLD_TAG), never directly under alpha/latest: `npm publish --tag X`
+      #     always moves X, which would bypass the monotonic guard below.
+      #  3. Verify npm provenance of NAME@VERSION on the registry (BOTH paths):
+      #     sigstore-verified SLSA attestation whose Fulcio cert + predicate
+      #     name THIS repo, THIS workflow, THIS tag ref and EXPECTED_SHA, and
+      #     whose subject digest == the registry tarball integrity; plus
+      #     `npm audit signatures` on a clean install. No provenance -> never
+      #     promote (defends against a leaked token + forged gitHead).
+      #  4. Move the channel tag(s) with `npm dist-tag add` ONLY if VERSION is
       #     semver-greater than what the tag points at now (so an older tag
-      #     run finishing late never rolls alpha/latest back), then drop the
-      #     holding tag. Every operation here is idempotent.
-      #  4. Read the registry back and assert the final state (with retries
+      #     run finishing late never rolls alpha/latest back).
+      #  5. if: always() -- drop the holding tag if it points at VERSION, then
+      #     (also always) fail the run if the holding tag still exists.
+      #  6. Read the registry back and assert the final state (with retries
       #     for propagation delay).
       #
-      # NODE_AUTH_TOKEN is only given to the steps that write (2 and 3).
+      # NODE_AUTH_TOKEN is only given to the steps that write (2, 4, 5).
       # ------------------------------------------------------------------
       - name: Plan release (idempotency check)
-        env:
-          HOLD_TAG: publish-staging
+        id: plan
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
-          HEAD_SHA="$(git rev-parse HEAD)"
           # prerelease versions (contain a hyphen, e.g. 0.1.0-alpha.3) go to the
           # `alpha` channel; stable versions go to `latest`.
           case "$VERSION" in *-*) CHANNEL=alpha ;; *) CHANNEL=latest ;; esac
 
-          # Use npm's own bundled semver for comparisons (no added deps).
-          SEMVER_DIR="$(npm root -g)/npm/node_modules/semver"
-          if ! node -e 'require(process.argv[1])' "$SEMVER_DIR"; then
-            echo "::error::cannot load npm's bundled semver at $SEMVER_DIR"
+          # Use npm's own bundled semver / sigstore (no added deps).
+          NPM_MODULES_DIR="$(npm root -g)/npm/node_modules"
+          SEMVER_DIR="$NPM_MODULES_DIR/semver"
+          for m in semver sigstore @sigstore/core; do
+            if ! node -e 'require(process.argv[1])' "$NPM_MODULES_DIR/$m"; then
+              echo "::error::cannot load npm's bundled $m from $NPM_MODULES_DIR"
+              exit 1
+            fi
+          done
+
+          # 1. Existence, decided by `version` (NOT gitHead: for a version that
+          #    exists but has no gitHead, `npm view <v> gitHead --json` prints
+          #    nothing with rc=0 -- indistinguishable from "absent").
+          set +e
+          VIEW_OUT="$(npm view "$NAME@$VERSION" version --json --prefer-online 2>"$RUNNER_TEMP/view.err")"
+          VIEW_RC=$?
+          set -e
+          if [ "$VIEW_RC" -ne 0 ]; then
+            if grep -q 'code E404' "$RUNNER_TEMP/view.err" || printf '%s' "$VIEW_OUT" | grep -q '"code": *"E404"'; then
+              echo "$NAME@$VERSION is not on the registry yet -> will publish"
+              ALREADY_PUBLISHED=no
+            else
+              cat "$RUNNER_TEMP/view.err" >&2
+              echo "::error::npm view $NAME@$VERSION version failed (rc=$VIEW_RC) with a non-404 error; refusing to guess"
+              exit 1
+            fi
+          elif [ "$VIEW_OUT" = "\"$VERSION\"" ]; then
+            ALREADY_PUBLISHED=yes
+          else
+            echo "::error::npm view $NAME@$VERSION version returned rc=0 but unexpected output '${VIEW_OUT}'; refusing to guess"
             exit 1
           fi
 
-          set +e
-          VIEW_OUT="$(npm view "$NAME@$VERSION" gitHead --json --prefer-online 2>"$RUNNER_TEMP/view.err")"
-          VIEW_RC=$?
-          set -e
-          ALREADY_PUBLISHED=no
-          if [ "$VIEW_RC" -ne 0 ]; then
-            if grep -q 'E404' "$RUNNER_TEMP/view.err" || printf '%s' "$VIEW_OUT" | grep -q '"E404"'; then
-              echo "$NAME@$VERSION is not on the registry yet -> will publish"
-            else
-              cat "$RUNNER_TEMP/view.err" >&2
-              echo "::error::npm view $NAME@$VERSION failed (rc=$VIEW_RC) with a non-404 error; refusing to guess"
+          # 2. Present -> it must claim to be THIS commit (pre-filter only).
+          if [ "$ALREADY_PUBLISHED" = yes ]; then
+            GH_OUT="$(npm view "$NAME@$VERSION" gitHead --json --prefer-online)"
+            REG_HEAD="$(printf '%s' "$GH_OUT" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let v="";try{v=d.trim()?JSON.parse(d):""}catch{v=""}process.stdout.write(typeof v==="string"?v:"")})')"
+            if [ -z "$REG_HEAD" ]; then
+              echo "::error::$NAME@$VERSION already exists on the registry but has NO gitHead, so it was not published by this workflow. Refusing: bump the version instead."
+              exit 1
+            elif [ "$REG_HEAD" != "$EXPECTED_SHA" ]; then
+              echo "::error::$NAME@$VERSION already exists on the registry with gitHead=$REG_HEAD, but this run is $EXPECTED_SHA. Refusing: bump the version instead."
               exit 1
             fi
-          elif [ -z "$VIEW_OUT" ]; then
-            # older npm prints nothing (rc=0) for a missing version
-            echo "$NAME@$VERSION is not on the registry yet -> will publish"
-          else
-            REG_HEAD="$(printf '%s' "$VIEW_OUT" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const v=JSON.parse(d);process.stdout.write(typeof v==="string"?v:"")})')"
-            if [ "$REG_HEAD" = "$HEAD_SHA" ]; then
-              echo "$NAME@$VERSION already published from $HEAD_SHA -> skipping publish (re-run)"
-              ALREADY_PUBLISHED=yes
-            else
-              echo "::error::$NAME@$VERSION already exists on the registry with gitHead='${REG_HEAD:-<none>}', but this run is $HEAD_SHA. Refusing: bump the version instead."
-              exit 1
-            fi
+            echo "$NAME@$VERSION already on the registry claiming gitHead $EXPECTED_SHA -> skipping publish (re-run); provenance is verified next"
           fi
 
           {
             echo "NAME=$NAME"
             echo "VERSION=$VERSION"
-            echo "HEAD_SHA=$HEAD_SHA"
             echo "CHANNEL=$CHANNEL"
-            echo "HOLD_TAG=$HOLD_TAG"
+            echo "NPM_MODULES_DIR=$NPM_MODULES_DIR"
             echo "SEMVER_DIR=$SEMVER_DIR"
             echo "ALREADY_PUBLISHED=$ALREADY_PUBLISHED"
           } >> "$GITHUB_ENV"
 
       - name: Publish to npm (under holding dist-tag)
         if: env.ALREADY_PUBLISHED != 'yes'
+        timeout-minutes: 4
         run: |
           set -euo pipefail
           echo "publishing $NAME@$VERSION with holding dist-tag $HOLD_TAG"
@@ -166,7 +217,40 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # Runs on BOTH paths (fresh publish and "already published" re-run).
+      # Nothing is promoted unless this passes.
+      - name: Verify npm provenance (repo + workflow + ref + commit)
+        timeout-minutes: 6
+        env:
+          EXPECT_REPO: openmaxai/email-mcp
+          EXPECT_REPO_ID: ${{ github.repository_id }}
+          EXPECT_WORKFLOW_PATH: .github/workflows/release.yml
+          EXPECT_REF: ${{ github.ref }}
+          ATTEST_ATTEMPTS: '9'
+        run: |
+          set -euo pipefail
+          PKG_NAME="$NAME" PKG_VERSION="$VERSION" EXPECT_SHA="$EXPECTED_SHA" \
+            node .github/scripts/verify-npm-provenance.cjs
+
+          # Independent check with npm's own verifier: install exactly
+          # NAME@VERSION into a throwaway project (no lifecycle scripts) and
+          # run `npm audit signatures` (registry signatures + attestations).
+          AUDIT_DIR="$(mktemp -d "$RUNNER_TEMP/audit.XXXXXX")"
+          (
+            cd "$AUDIT_DIR"
+            npm init -y >/dev/null
+            npm install --ignore-scripts --no-audit --no-fund --save-exact --prefer-online "$NAME@$VERSION"
+            INSTALLED="$(node -e 'const l=require("./package-lock.json");const p=l.packages["node_modules/"+process.argv[1]]||{};process.stdout.write((p.version||"")+" "+(p.integrity||""))' "$NAME")"
+            WANT="$(npm view "$NAME@$VERSION" dist.integrity --prefer-online)"
+            if [ "$INSTALLED" != "$VERSION $WANT" ]; then
+              echo "::error::throwaway install resolved '$INSTALLED', want '$VERSION $WANT'"
+              exit 1
+            fi
+            npm audit signatures
+          )
+
       - name: Move dist-tags (monotonic guard)
+        timeout-minutes: 4
         run: |
           set -euo pipefail
           # Wait until the version is visible (registry propagation).
@@ -200,22 +284,56 @@ jobs:
             fi
           done
           echo "TARGETS=$TARGETS" >> "$GITHUB_ENV"
-
-          if [ -n "$(npm view "$NAME" "dist-tags.$HOLD_TAG" --prefer-online)" ]; then
-            npm dist-tag rm "$NAME" "$HOLD_TAG"
-          fi
           echo "--- dist-tags now ---"
           npm dist-tag ls "$NAME"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # Cleanup runs even if anything above failed, timed out or was cancelled
+      # (as long as planning succeeded, i.e. NAME/VERSION are known). It only
+      # removes the holding tag when it points at THIS version, and is a no-op
+      # when the package or the tag does not exist.
+      - name: Remove holding dist-tag (always)
+        if: always() && steps.plan.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          set +e
+          TAGS_JSON="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/tags.err")"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -q 'code E404' "$RUNNER_TEMP/tags.err" || printf '%s' "$TAGS_JSON" | grep -q '"code": *"E404"'; then
+              echo "$NAME is not on the registry; no holding tag to remove"; exit 0
+            fi
+            cat "$RUNNER_TEMP/tags.err" >&2
+            echo "::error::could not read dist-tags of $NAME (rc=$rc); holding tag $HOLD_TAG state unknown"
+            exit 1
+          fi
+          HOLD="$(printf '%s' "$TAGS_JSON" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const t=JSON.parse(d)||{};process.stdout.write(String(t[process.argv[1]]||""))})' "$HOLD_TAG")"
+          if [ -z "$HOLD" ]; then
+            echo "holding tag $HOLD_TAG not set; nothing to do"
+          elif [ "$HOLD" = "$VERSION" ]; then
+            for i in 1 2 3; do
+              if npm dist-tag rm "$NAME" "$HOLD_TAG"; then echo "removed $HOLD_TAG (was $VERSION)"; exit 0; fi
+              echo "dist-tag rm failed (attempt $i), retrying..."; sleep 5
+            done
+            echo "::error::failed to remove holding tag $HOLD_TAG ($VERSION)"; exit 1
+          else
+            echo "::error::holding tag $HOLD_TAG points at $HOLD, not this run's $VERSION -- left in place (stale from an earlier failed cleanup?). Remove it manually: npm dist-tag rm $NAME $HOLD_TAG"
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Verify registry state
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           for i in 1 2 3 4 5 6; do
             ok=yes
             REG_HEAD="$(npm view "$NAME@$VERSION" gitHead --prefer-online 2>/dev/null || true)"
-            if [ "$REG_HEAD" != "$HEAD_SHA" ]; then ok=no; echo "gitHead: got '${REG_HEAD}', want $HEAD_SHA"; fi
+            if [ "$REG_HEAD" != "$EXPECTED_SHA" ]; then ok=no; echo "gitHead: got '${REG_HEAD}', want $EXPECTED_SHA"; fi
             for TAG in $TARGETS; do
               CUR="$(npm view "$NAME" "dist-tags.$TAG" --prefer-online 2>/dev/null || true)"
               MOVED_VAR="EXPECT_MOVED_$TAG"
@@ -227,14 +345,38 @@ jobs:
                   || { ok=no; echo "$TAG: got '$CUR', want >= $VERSION"; }
               fi
             done
-            HOLD="$(npm view "$NAME" "dist-tags.$HOLD_TAG" --prefer-online 2>/dev/null || true)"
-            if [ -n "$HOLD" ]; then ok=no; echo "holding tag $HOLD_TAG still set to $HOLD"; fi
             if [ "$ok" = yes ]; then
-              echo "OK: $NAME@$VERSION published from $HEAD_SHA; dist-tags as intended"
+              echo "OK: $NAME@$VERSION published from $EXPECTED_SHA; dist-tags as intended"
               npm dist-tag ls "$NAME"
               exit 0
             fi
             echo "registry state not converged yet (attempt $i), retrying..."; sleep 10
           done
           echo "::error::registry state for $NAME@$VERSION did not converge to the intended state"
+          exit 1
+
+      # Always report the holding-tag state, even when earlier steps failed,
+      # so a leftover public `publish-staging` tag can never go unnoticed.
+      - name: Verify holding dist-tag is gone (always)
+        if: always() && steps.plan.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4; do
+            set +e
+            TAGS_JSON="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/tags.err")"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              if grep -q 'code E404' "$RUNNER_TEMP/tags.err" || printf '%s' "$TAGS_JSON" | grep -q '"code": *"E404"'; then
+                echo "OK: $NAME is not on the registry; no holding tag"; exit 0
+              fi
+              HOLD="<unreadable: npm view rc=$rc>"
+            else
+              HOLD="$(printf '%s' "$TAGS_JSON" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const t=JSON.parse(d)||{};process.stdout.write(String(t[process.argv[1]]||""))})' "$HOLD_TAG")"
+              if [ -z "$HOLD" ]; then echo "OK: holding tag $HOLD_TAG is not set"; exit 0; fi
+            fi
+            echo "holding tag $HOLD_TAG: $HOLD (attempt $i), re-checking..."; sleep 10
+          done
+          echo "::error::holding dist-tag $HOLD_TAG is still set on $NAME ($HOLD). It is PUBLIC: remove it (npm dist-tag rm $NAME $HOLD_TAG) and re-run this job."
           exit 1

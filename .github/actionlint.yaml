@@ -1,0 +1,7 @@
+# actionlint (<= 1.7.12) does not yet know `concurrency.queue`, which GitHub
+# Actions supports (docs.github.com > Workflow syntax > concurrency: `queue`
+# = single | max). Suppress only that one false positive, only for release.yml.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
