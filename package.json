@@ -1,0 +1,52 @@
+{
+  "name": "@openmaxai/email-mcp",
+  "version": "0.1.0",
+  "description": "Stdio MCP server for email: send via SMTP, read via IMAP or POP3. Works with any provider that supports app passwords / authorization codes.",
+  "type": "module",
+  "bin": {
+    "email-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/index.js",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "test:integration": "npm run build && vitest run --config vitest.integration.config.ts",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "email",
+    "smtp",
+    "imap",
+    "pop3"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "imapflow": "^2.0.6",
+    "mailparser": "^3.9.28",
+    "node-pop3": "^0.15.3",
+    "nodemailer": "^10.0.10",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^26.6.2",
+    "@types/nodemailer": "^8.0.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
