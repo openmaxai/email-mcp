@@ -7,7 +7,7 @@ A stdio [MCP](https://modelcontextprotocol.io) server that lets an AI agent send
 - All configuration comes from environment variables. `EMAIL_PASSWORD` is the only secret.
 - Logs go to stderr only (stdout carries the MCP protocol). Passwords and message bodies are never logged.
 
-Requires Node.js 20.11 or newer.
+Requires Node.js 20.19 or newer.
 
 ## Install (Claude Code)
 
