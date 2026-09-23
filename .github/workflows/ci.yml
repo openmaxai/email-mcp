@@ -70,3 +70,62 @@ jobs:
           npm init -y >/dev/null
           npm install --engine-strict --omit=dev --no-audit --no-fund "$TARBALL"
           node "$GITHUB_WORKSPACE/scripts/smoke-packed.mjs" node_modules/@openmaxai/email-mcp/dist/index.js
+
+  # Gate for the release tooling (release.yml never runs on PRs): offline
+  # fixture tests for .github/scripts/verify-npm-provenance.cjs, plus
+  # actionlint (with shellcheck) over every workflow.
+  release-verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The verifier loads the sigstore libs BUNDLED inside npm (no added
+      # deps), and that module layout is not a public npm API -- so the tests
+      # must run against exactly the npm release.yml pins. Keep in sync with
+      # NPM_VERSION in release.yml.
+      NPM_VERSION: 10.9.7
+      ACTIONLINT_VERSION: 1.7.12
+      # sha256 of actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz, from the
+      # release's actionlint_${ACTIONLINT_VERSION}_checksums.txt.
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Pin npm
+        run: |
+          set -euo pipefail
+          npm install -g "npm@${NPM_VERSION}"
+          GOT="$(npm --version)"
+          if [ "$GOT" != "$NPM_VERSION" ]; then
+            echo "::error::npm is $GOT after pinning, want $NPM_VERSION"; exit 1
+          fi
+      - name: Check NPM_VERSION matches release.yml
+        run: |
+          set -euo pipefail
+          if ! grep -Eq "^  NPM_VERSION: ${NPM_VERSION}\$" .github/workflows/release.yml; then
+            echo "::error::release.yml NPM_VERSION differs from ci.yml NPM_VERSION=${NPM_VERSION}"; exit 1
+          fi
+      - name: Provenance verifier tests (offline fixtures)
+        run: |
+          set -euo pipefail
+          NPM_MODULES_DIR="$(npm root -g)/npm/node_modules" node --test .github/scripts/test/*.test.cjs
+      - name: Install actionlint (checksum-verified)
+        run: |
+          set -euo pipefail
+          TGZ="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$TGZ" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${TGZ}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$TGZ" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$TGZ" -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: actionlint (+ shellcheck on run scripts)
+        run: |
+          set -euo pipefail
+          # actionlint silently skips shell checks when shellcheck is absent.
+          shellcheck --version
+          actionlint -version
+          actionlint -color -shellcheck="$(command -v shellcheck)"
