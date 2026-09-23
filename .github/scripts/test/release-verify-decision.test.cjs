@@ -302,3 +302,52 @@ test('workflow: concurrency queue + monotonic guard + EXPECTED_SHA normalisation
   assert.match(wf.verify.text, /HEAD_SHA" != "\$EXPECTED_SHA"/);
   assert.match(wf.promote.text, /s\.gt\(v,c\)/);
 });
+
+// Timeout budget: a job whose step timeouts add up to (or past) its own
+// timeout-minutes can be killed by the job timeout before its last steps
+// (e.g. verify's first-publish deprecate fallback) get to run. Conservative
+// bound: the sum of ALL step timeouts (not just the worst real path) plus a
+// margin must fit inside the job timeout, and every step must carry its own.
+const TIMEOUT_MARGIN_MIN = 3;
+const stepTimeout = (s) => {
+  const m = s.text.match(/^ {8}timeout-minutes:\s*(\d+)\s*$/m);
+  return m ? Number(m[1]) : null;
+};
+
+test('workflow: every job has timeout-minutes >= sum(step timeouts) + margin', () => {
+  const budgets = {};
+  for (const j of Object.values(wf)) {
+    const jobTimeout = Number(j.keys['timeout-minutes']);
+    assert.ok(Number.isInteger(jobTimeout) && jobTimeout > 0, `${j.name}: no job-level timeout-minutes`);
+    assert.ok(j.steps.length > 0, `${j.name}: no steps parsed`);
+    let sum = 0;
+    for (const s of j.steps) {
+      const t = stepTimeout(s);
+      assert.ok(t !== null && t > 0, `${j.name} / ${s.name || s.id}: step has no timeout-minutes`);
+      sum += t;
+    }
+    budgets[j.name] = { sum, jobTimeout };
+    assert.ok(
+      sum + TIMEOUT_MARGIN_MIN <= jobTimeout,
+      `${j.name}: step timeouts sum to ${sum} min; job timeout-minutes ${jobTimeout} leaves < ${TIMEOUT_MARGIN_MIN} min margin`,
+    );
+  }
+  // The parser must actually have seen the four release jobs.
+  assert.deepEqual(Object.keys(budgets).sort(), ['cleanup', 'promote', 'publish', 'verify']);
+});
+
+test('workflow: verify logs dist-tags after publish, read-only and non-fatal', () => {
+  const st = wf.verify.steps.find((x) => x.id === 'disttags');
+  assert.ok(st, 'no dist-tags observation step in verify');
+  const ids = wf.verify.steps.map((x) => x.id);
+  assert.ok(ids.indexOf('presence') < ids.indexOf('disttags') && ids.indexOf('disttags') < ids.indexOf('verify'),
+    'dist-tags must be logged after the presence check and before provenance verification');
+  assert.equal(st.if, "always() && steps.presence.outputs.action == 'verify'");
+  assert.equal(st.token, false, 'observation step must not reference NODE_AUTH_TOKEN');
+  assert.doesNotMatch(st.text, /NPM_TOKEN|secrets\./);
+  assert.match(st.text, /^ {8}continue-on-error: true$/m);
+  assert.match(st.text, /npm view "\$NAME" dist-tags --json/);
+  assert.match(st.text, /JSON\.stringify\(JSON\.parse\(out\)\)/);
+  assert.match(st.text, /package not visible yet/);
+  assert.doesNotMatch(st.text, /npm (dist-tag|deprecate|publish|unpublish)/);
+});

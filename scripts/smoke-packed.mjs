@@ -4,7 +4,9 @@
 // Usage: node scripts/smoke-packed.mjs <path-to-installed-bin>
 // Spawns the stdio MCP server with dummy config (no network is touched at
 // startup), sends `initialize` + `tools/list` over stdin, and asserts both
-// JSON-RPC responses arrive. Uses only Node built-ins.
+// JSON-RPC responses arrive and are well-formed (initialize: jsonrpc 2.0,
+// dated protocolVersion, serverInfo name/version, tools capability;
+// tools/list: non-empty). Uses only Node built-ins.
 import { spawn } from 'node:child_process';
 
 const bin = process.argv[2];
@@ -12,6 +14,9 @@ if (!bin) {
   console.error('usage: smoke-packed.mjs <path-to-email-mcp-bin>');
   process.exit(2);
 }
+
+// serverInfo.name the server announces (src/server.ts McpServer name).
+const EXPECT_NAME = 'email-mcp';
 
 const env = {
   ...process.env,
@@ -61,7 +66,22 @@ child.stdout.on('data', (chunk) => {
     if (!pending.has(msg.id)) continue;
     if (msg.error) fail(`${pending.get(msg.id)} returned error: ${JSON.stringify(msg.error)}`);
     if (msg.id === 1) {
-      const name = msg.result?.serverInfo?.name;
+      const r = msg.result;
+      if (msg.jsonrpc !== '2.0') { fail(`initialize: jsonrpc is ${JSON.stringify(msg.jsonrpc)}, want "2.0"`); return; }
+      if (!r || typeof r !== 'object') { fail(`initialize: no result object: ${line.slice(0, 200)}`); return; }
+      if (typeof r.protocolVersion !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.protocolVersion)) {
+        fail(`initialize: bad protocolVersion ${JSON.stringify(r.protocolVersion)}`); return;
+      }
+      if (r.serverInfo?.name !== EXPECT_NAME) {
+        fail(`initialize: serverInfo.name is ${JSON.stringify(r.serverInfo?.name)}, want ${JSON.stringify(EXPECT_NAME)}`); return;
+      }
+      if (typeof r.serverInfo?.version !== 'string' || !r.serverInfo.version) {
+        fail(`initialize: serverInfo.version missing: ${JSON.stringify(r.serverInfo)}`); return;
+      }
+      if (!r.capabilities || typeof r.capabilities !== 'object' || !r.capabilities.tools) {
+        fail(`initialize: capabilities.tools missing: ${JSON.stringify(r.capabilities)}`); return;
+      }
+      const name = r.serverInfo.name;
       console.log(`initialize ok: server=${name} version=${msg.result?.serverInfo?.version} protocol=${msg.result?.protocolVersion}`);
       pending.delete(1);
       send({ jsonrpc: '2.0', method: 'notifications/initialized' });
