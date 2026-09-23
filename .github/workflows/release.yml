@@ -8,6 +8,19 @@ on:
 permissions:
   contents: read
 
+# Approval model: exactly ONE human approval per release. Only the `publish`
+# job uses the protected `release` environment (required reviewers). verify /
+# promote / cleanup have NO environment, so they start automatically in the
+# same run once publish finishes and can never sit silently in `waiting`.
+# NPM_TOKEN is an ORGANIZATION secret (not a `release` environment secret),
+# so those jobs still resolve it; it is referenced step-level only, on the
+# five registry-writing steps. The only remaining waiting-risk is publish's
+# own approval never being given -- harmless, nothing has been published yet.
+#
+# NOTE: a stuck / failed / waiting release does NOT page anyone. After
+# pushing a tag, check the Actions tab until the run is green (publish
+# approved; verify, promote and cleanup succeeded).
+
 # Serialize releases: two tag runs must never interleave their publish /
 # verify / dist-tag jobs (the group is held by the whole run).
 # cancel-in-progress: false so a running publish is never killed midway.
@@ -38,9 +51,9 @@ env:
   # this validating writer (full-string patterns, no line breaks; see the
   # script) -- run only from a checkout that is the vetted, main-contained
   # commit (publish after its gate; verify after HEAD == expected_sha).
-  # Exceptions: the cleanup job runs on an UNVETTED checkout, so it never
-  # runs repo scripts and validates inline; the promote job has no checkout
-  # and writes only constants. Constant writes (`echo "action=none"`) need
+  # Exceptions: the cleanup and promote jobs have no checkout and write
+  # only constants (cleanup re-validates publish's VERSION output inline and
+  # never writes it to $GITHUB_ENV). Constant writes (`echo "action=none"`) need
   # no validation. Pinned by .github/scripts/test/release-env.test.cjs.
   ENV_WRITER: .github/scripts/release-env.cjs
 
@@ -57,6 +70,9 @@ jobs:
     # Defense-in-depth: gate publishes behind a protected environment. Configure
     # required reviewers + a deployment tag policy on the `release` environment
     # (Settings > Environments) so every publish needs a human approval.
+    # This is the ONLY job with an environment (the single approval per
+    # release); the downstream jobs must not add one (pinned by
+    # release-verify-decision.test.cjs) or they could wait silently.
     environment: release
     permissions:
       contents: read
@@ -344,9 +360,7 @@ jobs:
   #
   # NOT covered (the first-publish deprecation then does not happen and
   # `latest` may stay on an unverified version until someone re-runs): a
-  # REST force-cancel (bypasses always()); this job's `release` approval
-  # rejected, or never given (it then waits up to the 30-day approval limit);
-  # no runner; this job's own timeout-minutes killing it before the
+  # REST force-cancel (bypasses always()); no runner; this job's own timeout-minutes killing it before the
   # deprecate step; the publish job's outputs not being delivered after a
   # cancel / job timeout (outputs of completed steps are expected to be
   # kept; NOT live-verified by this workflow). Re-running the workflow
@@ -368,10 +382,9 @@ jobs:
     if: always() && needs.publish.outputs.planned == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # For NPM_TOKEN (deprecate / clear marker only; step-level). With required
-    # reviewers on `release`, this job needs its own approval: approve it even
-    # when publish failed -- rejecting it skips the first-publish mitigation.
-    environment: release
+    # No environment: runs automatically after publish (no second approval,
+    # so the first-publish mitigation can never sit in `waiting`). NPM_TOKEN
+    # is an org secret; step-level on deprecate / clear marker only.
     permissions:
       contents: read
     outputs:
@@ -590,9 +603,8 @@ jobs:
     if: needs.publish.result == 'success' && needs.verify.result == 'success' && needs.verify.outputs.provenance == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # For NPM_TOKEN (dist-tag add only; step-level). Needs its own approval
-    # when `release` has required reviewers.
-    environment: release
+    # No environment: runs automatically after publish + verify. NPM_TOKEN
+    # (org secret) is step-level on dist-tag add only.
     permissions:
       contents: read
     env:
@@ -720,20 +732,38 @@ jobs:
   # is started once all three have finished with ANY result -- success,
   # failure, timeout, cancelled, or skipped -- including when the run was
   # cancelled (on cancel the server re-evaluates `if` and `always()` stays
-  # true). It is NOT guaranteed to run when: the run is force-cancelled
-  # (REST force-cancel bypasses always()), this job's own `release`
-  # environment approval is rejected, a runner cannot be provisioned, or this
-  # job hits its own timeout / fails. If this job's approval is simply NEVER
-  # GIVEN, the job is not failed: it sits in `waiting` until GitHub's
-  # deployment-approval limit (30 days) expires it, and the PUBLIC holding
-  # tag ($HOLD_TAG) lingers that long. The same applies while an upstream job
-  # (verify / promote) is itself waiting for approval. In all these cases the
-  # holding tag may remain and the run does not report it; re-run this job
-  # or `npm dist-tag rm` by hand.
+  # true). It has no environment (no approval of its own) and neither do
+  # verify / promote, so it cannot sit in `waiting`: it runs automatically
+  # once publish (the single approved job) finishes. It is NOT guaranteed
+  # to run when: the run is force-cancelled (REST force-cancel bypasses
+  # always()), a runner cannot be provisioned, or this job hits its own
+  # timeout / fails. In those cases the PUBLIC holding tag ($HOLD_TAG) may
+  # remain and nobody is paged (check the Actions tab); re-run this job or
+  # `npm dist-tag rm` by hand. If publish's approval is never given, nothing
+  # was published, so there is no holding tag to clean up.
   #
-  # Scope: this job only ever removes $HOLD_TAG, and only when it points at
-  # this run's VERSION. It never touches `latest` / `alpha` and never
-  # deprecates anything.
+  # Inputs -- NOTHING is read from the tagged tree (no checkout at all):
+  #   - NAME is the workflow constant $EXPECT_NAME.
+  #   - VERSION comes ONLY from the publish job's outputs (written there by
+  #     the validating writer from the vetted checkout, planned=yes last),
+  #     and is re-validated here whole-string (meta step). It is passed as a
+  #     step env value and never written to $GITHUB_ENV; the only
+  #     $GITHUB_OUTPUT writes in this job are constants.
+  #   - If the outputs are MISSING (publish cancelled / timed out / failed
+  #     before its plan completed -- attacker-inducible, so there is NO
+  #     fallback to the tag tree) or INVALID, the holding tag is handled
+  #     version-independently: $HOLD_TAG is only ever this package's
+  #     holding tag and runs are serialized, so removing it whatever it
+  #     points at is safe. The job then goes RED (::error::, exit 1) if it
+  #     had to remove one without a known version, and ALWAYS when the
+  #     outputs were invalid.
+  #   - With a valid VERSION the stricter rule stays: remove $HOLD_TAG only
+  #     if it points at VERSION; one pointing elsewhere is left in place and
+  #     the final check fails the job (a leftover from another run should be
+  #     looked at by a human, not silently absorbed).
+  #
+  # Scope: this job only ever removes $HOLD_TAG. It never touches `latest` /
+  # `alpha` and never deprecates anything. npm runs in an empty directory.
   #
   # Jobs of one run never contend for the workflow-level concurrency group
   # (the group is held by the run), so no deadlock; no job-level concurrency.
@@ -741,96 +771,90 @@ jobs:
   # Its steps carry explicit `always() && <previous step succeeded>`
   # conditions (see the verify job) so they also run in a job started after
   # a run cancel.
-  #
-  # NAME/VERSION are re-derived from the tagged commit (publish may have
-  # died before producing its outputs). No project code is executed and npm
-  # never runs inside the checkout (a project .npmrc could otherwise redirect
-  # the registry / exfiltrate the token), since this job does NOT re-check
-  # that the tagged commit is in protected main.
   cleanup:
     name: Remove holding dist-tag
     needs: [publish, verify, promote]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Same environment as publish so NPM_TOKEN resolves whether it is a repo or
-    # a `release` environment secret. Consequence: with required reviewers on
-    # `release`, this job needs its own approval (approve it even when publish
-    # failed; rejecting it skips the cleanup). The token is step-level (rm only).
-    environment: release
+    # No environment (see the header): NPM_TOKEN is an org secret, so it
+    # resolves without `release`; step-level on the rm step only.
     permissions:
       contents: read
+    env:
+      # Untrusted until the meta step validated it; later steps use it only
+      # when steps.meta.outputs.known == 'yes'.
+      PUB_VERSION: ${{ needs.publish.outputs.version }}
+      PUB_PLANNED: ${{ needs.publish.outputs.planned }}
     steps:
-      - name: Checkout package.json of the tagged commit
-        id: checkout
-        if: always()
-        timeout-minutes: 2
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-          sparse-checkout: package.json
-          sparse-checkout-cone-mode: false
-          path: src
-
       - name: Setup Node (npm auth config only, no cache)
         id: node
-        if: always() && steps.checkout.outcome == 'success'
+        if: always()
         timeout-minutes: 3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
-      # The checkout is UNVETTED (any commit a v* tag points at), so no repo
-      # script runs here: the validation is inline and FULL-STRING (a JS regex
-      # without the m flag, plus an explicit line-break check). A line-oriented
-      # check (grep -E '^...$') would accept "9.9.9\nnpm_config_registry=..."
-      # and the value would inject extra variables via $GITHUB_ENV. Nothing is
-      # written unless every value passed; the write is one append.
-      #
-      # Tag/version mismatch is a HARD failure: publish refuses such a tag
-      # before its plan step, so this run cannot have created a holding tag
-      # of its own, and this job never touches another version's holding tag.
-      - name: Derive package name and version from the tagged commit
+      # Whole-string validation of the publish job's VERSION output (a JS
+      # regex without the m flag, an explicit length cap, a character
+      # whitelist and an explicit CR / LF / NUL / U+2028 / U+2029 check).
+      # Writes only constants: known=yes|no, invalid=yes. Exits 0 for a
+      # missing or invalid version so the version-independent removal still
+      # runs; the final step turns those cases red.
+      - name: Validate version from publish outputs
         id: meta
         if: always() && steps.node.outcome == 'success'
         timeout-minutes: 1
         run: |
           set -euo pipefail
           echo "job results: publish=$PUBLISH_RESULT verify=$VERIFY_RESULT promote=$PROMOTE_RESULT"
-          node - "$GITHUB_WORKSPACE/src/package.json" <<'JS'
-          const fs = require('node:fs');
-          const fail = (m) => { console.log(`::error::${m}`); process.exit(1); };
-          const { EXPECT_NAME, GITHUB_REF_NAME, GITHUB_ENV, RUNNER_TEMP } = process.env;
-          let pkg;
-          try { pkg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); } catch (e) { fail(`cannot read package.json: ${e.message}`); }
-          const { name, version } = pkg || {};
-          const bad = (v) => typeof v !== 'string' || /[\r\n]/.test(v);
-          if (bad(name) || name !== EXPECT_NAME) fail(`package.json name ${JSON.stringify(name)} is not ${JSON.stringify(EXPECT_NAME)}; refusing to touch its dist-tags`);
-          if (bad(version) || !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/.test(version)) {
-            fail(`package.json version ${JSON.stringify(version)} is not a plain single-line semver; refusing`);
+          mkdir -p "$RUNNER_TEMP/npm-cwd"
+          set +e
+          node - <<'JS'
+          const { PUB_VERSION: v = '', PUB_PLANNED: planned = '' } = process.env;
+          const shown = (s) => `${String(s).replace(/[^0-9A-Za-z.+-]/g, '?').slice(0, 64)} (length ${String(s).length})`;
+          if (planned !== 'yes' || v === '') {
+            console.log(`::warning::publish produced no (complete) outputs (planned=${shown(planned)}); version unknown, handling ${process.env.HOLD_TAG} version-independently`);
+            process.exit(3);
           }
-          const tagVersion = String(GITHUB_REF_NAME || '').replace(/^v/, '');
-          if (version !== tagVersion) fail(`tag ${JSON.stringify(GITHUB_REF_NAME)} != package.json version ${JSON.stringify(version)} (publish refused this tag, so this run created no holding tag); refusing`);
-          const cwd = `${RUNNER_TEMP}/npm-cwd`;
-          if (bad(cwd) || !/^\/[A-Za-z0-9._\/+@-]+$/.test(cwd)) fail(`unexpected RUNNER_TEMP ${JSON.stringify(RUNNER_TEMP)}`);
-          fs.mkdirSync(cwd, { recursive: true });
-          fs.appendFileSync(GITHUB_ENV, `NAME=${name}\nVERSION=${version}\nNPM_CWD=${cwd}\n`);
-          console.log(`${name}@${version}: checking holding tag`);
+          const ok = typeof v === 'string' && v.length <= 64
+            && !/[\0\r\n\u2028\u2029]/.test(v)
+            && /^[0-9A-Za-z.-]+$/.test(v)
+            && /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/.test(v);
+          if (!ok) {
+            console.log(`::error::publish output version ${shown(v)} is not a plain single-line semver; REJECTED, handling ${process.env.HOLD_TAG} version-independently`);
+            process.exit(4);
+          }
+          console.log(`${process.env.EXPECT_NAME}@${v}: checking holding tag`);
+          process.exit(0);
           JS
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "known=yes" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 3 ]; then
+            echo "known=no" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 4 ]; then
+            echo "known=no" >> "$GITHUB_OUTPUT"
+            echo "invalid=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::version validation crashed (rc=$rc)"; exit 1
+          fi
         env:
           PUBLISH_RESULT: ${{ needs.publish.result }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           PROMOTE_RESULT: ${{ needs.promote.result }}
 
-      # Read-only (no token). Decides; never writes.
+      # Read-only (no token). Decides; never writes to the registry.
       - name: Inspect holding dist-tag
         id: inspect
         if: always() && steps.meta.outcome == 'success'
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          cd "$NPM_CWD"
+          NAME="$EXPECT_NAME"
+          cd "$RUNNER_TEMP/npm-cwd"
           for i in 1 2 3; do
             set +e
             TAGS_JSON="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/tags.err")"
@@ -851,41 +875,48 @@ jobs:
           if [ -z "$HOLD" ]; then
             echo "holding tag $HOLD_TAG not set; nothing to do"
             echo "action=none" >> "$GITHUB_OUTPUT"
-          elif [ "$HOLD" = "$VERSION" ]; then
-            echo "holding tag $HOLD_TAG -> $VERSION (this run's version): will remove"
+          elif [ "$KNOWN" != yes ]; then
+            echo "::warning::holding tag $HOLD_TAG is set and this run's version is unknown: removing it version-independently"
+            echo "action=remove" >> "$GITHUB_OUTPUT"
+          elif [ "$HOLD" = "$PUB_VERSION" ]; then
+            echo "holding tag $HOLD_TAG -> $PUB_VERSION (this run's version): will remove"
             echo "action=remove" >> "$GITHUB_OUTPUT"
           else
-            # Not ours: never remove a tag pointing at another version. The
-            # final check below fails the run so it is noticed.
-            echo "::warning::holding tag $HOLD_TAG points at $HOLD, not this run's $VERSION -- leaving it in place"
+            # Not ours: never remove a tag pointing at another version when
+            # ours is known. The final check below fails the run.
+            echo "::warning::holding tag $HOLD_TAG does not point at this run's $PUB_VERSION -- leaving it in place"
             echo "action=foreign" >> "$GITHUB_OUTPUT"
           fi
+        env:
+          KNOWN: ${{ steps.meta.outputs.known }}
 
-      - name: Remove holding dist-tag (only if it points at this version)
+      - name: Remove holding dist-tag
         if: always() && steps.inspect.outputs.action == 'remove'
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          cd "$NPM_CWD"
+          NAME="$EXPECT_NAME"
+          cd "$RUNNER_TEMP/npm-cwd"
           for i in 1 2 3; do
-            if npm dist-tag rm "$NAME" "$HOLD_TAG"; then echo "removed $HOLD_TAG (was $VERSION)"; exit 0; fi
+            if npm dist-tag rm "$NAME" "$HOLD_TAG"; then echo "removed $HOLD_TAG"; exit 0; fi
             # Idempotent: a concurrent/earlier removal counts as success.
             CUR="$(npm view "$NAME" "dist-tags.$HOLD_TAG" --prefer-online 2>/dev/null || true)"
             if [ -z "$CUR" ]; then echo "$HOLD_TAG already gone"; exit 0; fi
             echo "dist-tag rm failed (attempt $i), retrying..."; sleep 5
           done
-          echo "::error::failed to remove holding tag $HOLD_TAG ($VERSION)"; exit 1
+          echo "::error::failed to remove holding tag $HOLD_TAG"; exit 1
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Runs whenever NAME/VERSION are known, even if the removal failed, so a
-      # leftover PUBLIC holding tag fails this job visibly.
+      # Runs whenever the inputs were checked, even if the removal failed, so
+      # a leftover PUBLIC holding tag fails this job visibly.
       - name: Verify holding dist-tag is gone
         if: always() && steps.meta.outcome == 'success'
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          cd "$NPM_CWD"
+          NAME="$EXPECT_NAME"
+          cd "$RUNNER_TEMP/npm-cwd"
           for i in 1 2 3 4; do
             set +e
             TAGS_JSON="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/tags.err")"
@@ -904,3 +935,22 @@ jobs:
           done
           echo "::error::holding dist-tag $HOLD_TAG is still set on $NAME ($HOLD). It is PUBLIC: remove it (npm dist-tag rm $NAME $HOLD_TAG) and re-run this job."
           exit 1
+
+      # Missing / invalid publish outputs must never look like a clean run.
+      - name: Fail if the version was unknown or invalid
+        if: always() && steps.meta.outputs.known == 'no'
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          if [ "$INVALID" = yes ]; then
+            echo "::error::the publish job's version output was INVALID and was rejected; $HOLD_TAG was handled version-independently. Investigate this run."
+            exit 1
+          fi
+          if [ "$ACTION" = remove ]; then
+            echo "::error::version unknown (publish produced no outputs); $HOLD_TAG was removed version-independently. Check the registry state of $EXPECT_NAME."
+            exit 1
+          fi
+          echo "version unknown (publish produced no outputs), but no holding tag was present; nothing to clean"
+        env:
+          INVALID: ${{ steps.meta.outputs.invalid }}
+          ACTION: ${{ steps.inspect.outputs.action }}

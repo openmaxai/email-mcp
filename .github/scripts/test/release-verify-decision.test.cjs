@@ -266,18 +266,25 @@ test('workflow: verify + cleanup steps run in a job started after a cancel (expl
         assert.match(st.if, /^success\(\) && /);
         continue;
       }
-      assert.match(st.if, /^always\(\) && steps\.[a-z]+\.(outcome == 'success'|outputs\.action == '[a-z]+')$/, `${job}: ${st.name}`);
+      assert.match(st.if, /^always\(\) && steps\.[a-z]+\.(outcome == 'success'|outputs\.[a-z]+ == '[a-z]+')$/, `${job}: ${st.name}`);
     }
   }
   // promote must NOT run after a cancel / failure
   for (const st of wf.promote.steps) assert.doesNotMatch(st.if || '', /always\(\)/);
 });
 
-test('workflow: environment release on every job; NODE_AUTH_TOKEN only on writing steps', () => {
-  for (const j of Object.values(wf)) assert.equal(j.keys.environment, 'release', `${j.name} environment`);
+test('workflow: environment release ONLY on publish (one approval); NODE_AUTH_TOKEN only on writing steps', () => {
+  assert.deepEqual(Object.keys(wf).sort(), ['cleanup', 'promote', 'publish', 'verify']);
+  assert.equal(wf.publish.keys.environment, 'release', 'publish environment');
+  // Downstream jobs must not have an environment: with required reviewers
+  // each would need its own approval and could sit silently in `waiting`.
+  for (const name of ['verify', 'promote', 'cleanup']) {
+    assert.equal(wf[name].keys.environment, undefined, `${name} must have no environment`);
+    assert.doesNotMatch(wf[name].text, /^\s*environment:/m, `${name} must have no environment`);
+  }
   const withToken = Object.values(wf).flatMap((j) => j.steps.filter((s) => s.token).map((s) => `${j.name}: ${s.name}`));
   assert.deepEqual(withToken.sort(), [
-    'cleanup: Remove holding dist-tag (only if it points at this version)',
+    'cleanup: Remove holding dist-tag',
     'promote: Move dist-tags (monotonic guard)',
     'publish: Publish to npm (under holding dist-tag)',
     "verify: Clear this workflow's provenance-failure deprecation",
