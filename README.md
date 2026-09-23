@@ -135,7 +135,7 @@ Integration tests start a throwaway [GreenMail](https://greenmail-mail-test.gith
 
 Pushing a `v*` tag starts the Release workflow. It needs one approval (the `publish` job, `release` environment); provenance verification, dist-tag promotion and holding-tag cleanup then run automatically. A stuck, waiting or failed release does not notify anyone: after tagging, check the Actions tab until the run is green.
 
-Releases are serialized (`concurrency` with `queue: max`): if a run's `publish` approval is never given, that run holds the queue for up to 30 days and every later tag's run waits behind it. To recover, cancel the stuck run in the Actions tab (nothing was published, so nothing needs cleaning up); the next queued run then starts. When re-running an older run's `cleanup` job by hand, do so only if no newer release run has started since: with that run's publish outputs missing it removes the `publish-staging` dist-tag whatever version it points at.
+Releases are serialized (`concurrency` with `queue: max`): if a run's `publish` approval is never given, that run holds the queue for up to 30 days and every later tag's run waits behind it. To recover, cancel the stuck run in the Actions tab (nothing was published, so nothing needs cleaning up); the next queued run then starts. When re-running an older run's `cleanup` job by hand, do so only if no newer release run has started since: with that run's publish outputs missing or invalid it removes the `publish-staging` dist-tag whatever version it points at.
 
 ## License
 

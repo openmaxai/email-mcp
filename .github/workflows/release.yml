@@ -505,8 +505,10 @@ jobs:
         run: |
           set -uo pipefail
           cd "$NPM_CWD" || exit 0
-          TAGS_OUT="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/disttags.err")"
-          TAGS_RC=$?
+          # The runner's default shell is `bash -e`: capture npm's status
+          # instead of letting a failing `npm view` end the step early.
+          TAGS_RC=0
+          TAGS_OUT="$(npm view "$NAME" dist-tags --json --prefer-online 2>"$RUNNER_TEMP/disttags.err")" || TAGS_RC=$?
           TAGS_RC="$TAGS_RC" TAGS_OUT="$TAGS_OUT" TAGS_ERR="$(cat "$RUNNER_TEMP/disttags.err" 2>/dev/null)" node -e '
             const esc = (s) => String(s).slice(0, 2000).replace(/::/g, ": :")
               .replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
@@ -787,8 +789,9 @@ jobs:
   # remain and nobody is paged (check the Actions tab); re-run this job or
   # `npm dist-tag rm` by hand. CAUTION: re-run an OLDER run's cleanup only if
   # no newer release run has started since -- with that run's publish outputs
-  # missing it removes $HOLD_TAG version-independently, i.e. possibly a newer
-  # run's holding tag (blast radius: `dist-tag rm $HOLD_TAG` only).
+  # missing or invalid it removes $HOLD_TAG version-independently, i.e.
+  # possibly a newer run's holding tag (blast radius: `dist-tag rm $HOLD_TAG`
+  # only).
   # If publish's approval is never given, nothing
   # was published, so there is no holding tag to clean up.
   #
@@ -926,7 +929,7 @@ jobs:
             echo "holding tag $HOLD_TAG not set; nothing to do"
             echo "action=none" >> "$GITHUB_OUTPUT"
           elif [ "$KNOWN" != yes ]; then
-            echo "::warning::holding tag $HOLD_TAG is set and this run's version is unknown: removing it version-independently"
+            echo "::warning::holding tag $HOLD_TAG is set and this run's version is unknown (publish outputs missing or invalid): removing it version-independently"
             echo "action=remove" >> "$GITHUB_OUTPUT"
           elif [ "$HOLD" = "$PUB_VERSION" ]; then
             echo "holding tag $HOLD_TAG -> $PUB_VERSION (this run's version): will remove"
