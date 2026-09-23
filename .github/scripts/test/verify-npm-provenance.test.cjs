@@ -77,15 +77,20 @@ const CASES = {
   },
 };
 
-function run(c, { manifest, attestations, expected, verifyBundle } = {}) {
+function run(c, { manifest, attestations, expected, verifyBundle, parseCert } = {}) {
   return V.verifyProvenance({
     manifest: manifest || clone(c.manifest),
     attestations: attestations || clone(c.attestations),
     expected: { ...c.expected, ...expected },
     verifyBundle: verifyBundle || realVerifyBundle,
     libs,
+    ...(parseCert ? { parseCert } : {}),
   });
 }
+
+// Every check id that some negative test observed as THE failure cause;
+// the meta-test at the end requires every check the verifier declares.
+const HIT = new Set();
 
 function rejects(fn, check, sigstoreCode) {
   let err;
@@ -98,7 +103,34 @@ function rejects(fn, check, sigstoreCode) {
   assert.ok(err instanceof V.ProvenanceError, `unexpected non-ProvenanceError: ${err && err.stack}`);
   assert.equal(err.check, check, `failed at ${err.check} (${err.message}), want ${check}`);
   if (sigstoreCode) assert.match(String(err.sigstoreCode), sigstoreCode, err.message);
+  HIT.add(err.check);
   return err;
+}
+
+// DER UTF8String, as Fulcio encodes its v2 extensions (short-form length).
+function utf8Der(str) {
+  const b = Buffer.from(str, 'utf8');
+  assert.ok(b.length < 128);
+  return Buffer.concat([Buffer.from([0x0c, b.length]), b]);
+}
+// parseCert wrapper around the REAL parsed fixture certificate: overrides
+// the SAN and/or individual Fulcio extensions (string -> UTF8String,
+// Buffer -> raw extnValue, null -> extension absent). Stands in for a
+// Fulcio-signed certificate with different identity claims (e.g. a
+// self-hosted runner), which cannot be produced without forging one.
+function certWith({ san, ext = {} } = {}) {
+  return (der) => {
+    const real = libs.core.X509Certificate.parse(der);
+    return {
+      get subjectAltName() { return san !== undefined ? san : real.subjectAltName; },
+      extension(oid) {
+        if (!Object.prototype.hasOwnProperty.call(ext, oid)) return real.extension(oid);
+        const v = ext[oid];
+        if (v === null) return undefined;
+        return { value: Buffer.isBuffer(v) ? v : utf8Der(v) };
+      },
+    };
+  };
 }
 
 const provOf = (att) => att.attestations.find((a) => a.predicateType === V.SLSA_V1);
@@ -263,6 +295,68 @@ for (const [label, c] of Object.entries(CASES)) {
     rejects(() => run(c, { attestations: a, verifyBundle: noCrypto }), 'cert.present');
     rejects(() => run(c, { attestations: a }), 'bundle.sigstore');
   });
+
+  // --- certificate identity (Fulcio extensions + SAN) ------------------------
+  // Real crypto on the genuine bundle; only the parsed certificate is
+  // swapped (certWith), so each identity check must be the first failure.
+  test(`${label}: faithful cert wrapper (no overrides) still verifies`, () => {
+    assert.doesNotThrow(() => run(c, { parseCert: certWith() }));
+  });
+  test(`${label}: wrong repo with crypto skipped -> rejected by cert SAN`, () => {
+    rejects(() => run(c, { expected: { repo: 'evil/repo' }, verifyBundle: noCrypto }), 'cert.san');
+  });
+  const signer = () => `https://github.com/${c.expected.repo}/${c.expected.workflowPath}@${c.expected.ref}`;
+  const certTampers = {
+    'cert.san': () => ({ san: `${signer()}x` }),
+    'cert.issuer': () => ({ ext: { [V.OID.issuer]: 'https://token.actions.evil.example' } }),
+    'cert.buildSignerURI': () => ({ ext: { [V.OID.buildSignerURI]: 'https://github.com/evil/repo/.github/workflows/x.yml@refs/heads/main' } }),
+    'cert.runnerEnvironment': () => ({ ext: { [V.OID.runnerEnvironment]: 'self-hosted' } }),
+    'cert.sourceRepoURI': () => ({ ext: { [V.OID.sourceRepoURI]: 'https://github.com/evil/repo' } }),
+    'cert.sourceRepoIdentifier': () => ({ ext: { [V.OID.sourceRepoIdentifier]: '1' } }),
+    'cert.sourceRepoRef': () => ({ ext: { [V.OID.sourceRepoRef]: 'refs/heads/evil' } }),
+    'cert.sourceRepoDigest': () => ({ ext: { [V.OID.sourceRepoDigest]: 'f'.repeat(40) } }),
+  };
+  for (const [check, mk] of Object.entries(certTampers)) {
+    test(`${label}: cert identity tamper -> ${check}`, () => {
+      rejects(() => run(c, { parseCert: certWith(mk()) }), check);
+    });
+  }
+  test(`${label}: self-hosted runner: runnerEnvironment missing -> rejected`, () => {
+    rejects(() => run(c, { parseCert: certWith({ ext: { [V.OID.runnerEnvironment]: null } }) }), 'cert.runnerEnvironment');
+  });
+  test(`${label}: every identity extension missing -> rejected at that extension`, () => {
+    for (const [check, oid] of [['cert.issuer', V.OID.issuer], ['cert.buildSignerURI', V.OID.buildSignerURI],
+      ['cert.sourceRepoURI', V.OID.sourceRepoURI], ['cert.sourceRepoIdentifier', V.OID.sourceRepoIdentifier],
+      ['cert.sourceRepoRef', V.OID.sourceRepoRef], ['cert.sourceRepoDigest', V.OID.sourceRepoDigest]]) {
+      rejects(() => run(c, { parseCert: certWith({ ext: { [oid]: null } }) }), check);
+    }
+  });
+  test(`${label}: extension not a DER UTF8String -> cert.extension`, () => {
+    const octet = Buffer.concat([Buffer.from([0x04, 13]), Buffer.from('github-hosted')]);
+    rejects(() => run(c, { parseCert: certWith({ ext: { [V.OID.runnerEnvironment]: octet } }) }), 'cert.extension');
+  });
+
+  // --- DSSE payload -----------------------------------------------------------
+  test(`${label}: DSSE payload not JSON -> dsse.payload`, () => {
+    const a = clone(c.attestations);
+    provOf(a).bundle.dsseEnvelope.payload = Buffer.from('not json').toString('base64');
+    rejects(() => run(c, { attestations: a, verifyBundle: noCrypto }), 'dsse.payload');
+    rejects(() => run(c, { attestations: a }), 'bundle.sigstore');
+  });
+
+  // --- expected-identity input validation ------------------------------------
+  test(`${label}: missing expected fields -> input.<field>`, () => {
+    for (const k of ['name', 'version', 'repo', 'repoId', 'workflowPath', 'ref', 'sha']) {
+      rejects(() => run(c, { expected: { [k]: '' } }), `input.${k}`);
+      rejects(() => run(c, { expected: { [k]: undefined } }), `input.${k}`);
+    }
+  });
+  test(`${label}: malformed expected repo / repoId / ref -> rejected before anything else`, () => {
+    rejects(() => run(c, { expected: { repo: 'no-slash' } }), 'input.repo');
+    rejects(() => run(c, { expected: { repo: 'a/b/c' } }), 'input.repo');
+    rejects(() => run(c, { expected: { repoId: '12a' } }), 'input.repoId');
+    rejects(() => run(c, { expected: { ref: 'v1.0.0' } }), 'input.ref');
+  });
 }
 
 // The attestation of one package must not verify another package's identity.
@@ -298,4 +392,34 @@ test('CLI: missing env exits 1', () => {
   });
   assert.equal(r.status, 1);
   assert.match(r.stdout, /missing required env PKG_NAME/);
+});
+
+// Meta-test (must stay LAST): every check id the verifier can throw must be
+// the first failure cause of at least one test above, so a newly added (or
+// deleted) check cannot go untested. Ids are read from the verifier source:
+// literal ProvenanceError('<id>') / expectEq(log, '<id>') plus the
+// `input.${k}` template expanded over validateExpected's `need` list.
+test('meta: every verifier check id is the failure cause of some test', () => {
+  const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'verify-npm-provenance.cjs'), 'utf8');
+  const ids = new Set();
+  for (const m of src.matchAll(/new ProvenanceError\('([^']+)'/g)) ids.add(m[1]);
+  for (const m of src.matchAll(/expectEq\(log, '([^']+)'/g)) ids.add(m[1]);
+  const tmpl = [...src.matchAll(/new ProvenanceError\(`input\.\$\{k\}`/g)].length;
+  assert.equal(tmpl, 1, 'expected exactly one templated input.${k} check');
+  const need = src.match(/const need = \[([^\]]+)\]/);
+  assert.ok(need, 'need list not found');
+  for (const m of need[1].matchAll(/'([^']+)'/g)) ids.add(`input.${m[1]}`);
+  // no other non-literal check ids (they could not be enumerated)
+  // (expectEq's own `new ProvenanceError(check, ...)` forwards its literal id)
+  const all = [...src.matchAll(/new ProvenanceError\(/g)].length;
+  const literal = [...src.matchAll(/new ProvenanceError\('[^']+'/g)].length;
+  const forwarded = [...src.matchAll(/new ProvenanceError\(check, /g)].length;
+  assert.equal(forwarded, 1, 'expected only expectEq to forward a check id');
+  assert.equal(all, literal + tmpl + forwarded, 'ProvenanceError with a non-literal check id');
+  const expectEqCalls = [...src.matchAll(/expectEq\(/g)].length - 1; // minus the definition
+  const expectEqLiteral = [...src.matchAll(/expectEq\(log, '[^']+'/g)].length;
+  assert.equal(expectEqCalls, expectEqLiteral, 'expectEq with a non-literal check id');
+  assert.ok(ids.size >= 36, `only ${ids.size} check ids found`);
+  const missing = [...ids].filter((id) => !HIT.has(id)).sort();
+  assert.deepEqual(missing, [], `check ids never observed as the failure cause: ${missing.join(', ')}`);
 });

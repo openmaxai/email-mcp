@@ -19,6 +19,7 @@
 //   verifyProvenance({ manifest, attestations, expected, verifyBundle, libs })
 //     pure + synchronous: throws ProvenanceError{check} on the first failed
 //     check, returns a summary on success.
+//     (certificate parsing is injectable too: parseCert)
 //   makeBundleVerifier(libs, trustedRoot)
 //     real sigstore crypto (DSSE signature, Fulcio chain, SCT, Rekor tlog)
 //     against a given Sigstore trusted root. The CLI obtains that root via
@@ -133,9 +134,19 @@ function purlFor(name, version) {
  * @param {object} a.expected       { name, version, repo, repoId, workflowPath, ref, sha }
  * @param {Function} a.verifyBundle (bundleJSON, policy) => void, throws on failure (makeBundleVerifier)
  * @param {object} a.libs           loadLibs() result (X509/ASN1 parsing)
+ * @param {Function} [a.parseCert]  (derBuffer) => cert with .subjectAltName and
+ *                                  .extension(oid) -> { value } | undefined;
+ *                                  default libs.core.X509Certificate.parse.
+ *                                  Injectable (like verifyBundle) so tests can
+ *                                  present certificates whose identity
+ *                                  extensions differ from the real fixture's.
  * @param {Function} [a.log]
  */
-function verifyProvenance({ manifest, attestations, expected, verifyBundle, libs, log = () => {} }) {
+function verifyProvenance({
+  manifest, attestations, expected, verifyBundle, libs,
+  parseCert = (der) => libs.core.X509Certificate.parse(der),
+  log = () => {},
+}) {
   validateExpected(expected);
   const { name, version, repo, repoId, workflowPath, ref, sha } = expected;
   const repoURL = `https://github.com/${repo}`;
@@ -186,7 +197,7 @@ function verifyProvenance({ manifest, attestations, expected, verifyBundle, libs
     || (vm.x509CertificateChain && vm.x509CertificateChain.certificates
       && vm.x509CertificateChain.certificates[0] && vm.x509CertificateChain.certificates[0].rawBytes);
   if (!leafB64) throw new ProvenanceError('cert.present', 'bundle has no signing certificate');
-  const cert = libs.core.X509Certificate.parse(Buffer.from(leafB64, 'base64'));
+  const cert = parseCert(Buffer.from(leafB64, 'base64'));
   expectEq(log, 'cert.san', cert.subjectAltName, signerURI);
   expectEq(log, 'cert.issuer', certExt(libs, cert, OID.issuer), GHA_ISSUER);
   expectEq(log, 'cert.buildSignerURI', certExt(libs, cert, OID.buildSignerURI), signerURI);
@@ -307,6 +318,7 @@ async function main() {
 }
 
 module.exports = {
+  OID,
   ProvenanceError,
   verifyProvenance,
   makeBundleVerifier,

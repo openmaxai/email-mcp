@@ -72,8 +72,10 @@ jobs:
           node "$GITHUB_WORKSPACE/scripts/smoke-packed.mjs" node_modules/@openmaxai/email-mcp/dist/index.js
 
   # Gate for the release tooling (release.yml never runs on PRs): offline
-  # fixture tests for .github/scripts/verify-npm-provenance.cjs, plus
-  # actionlint (with shellcheck) over every workflow.
+  # tests in .github/scripts/test/ -- provenance verifier fixtures, the
+  # verify job's decision logic, the GITHUB_ENV/OUTPUT writer, and static
+  # checks of release.yml's job graph -- plus actionlint (with shellcheck)
+  # over every workflow.
   release-verifier:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -108,7 +110,7 @@ jobs:
           if ! grep -Eq "^  NPM_VERSION: ${NPM_VERSION}\$" .github/workflows/release.yml; then
             echo "::error::release.yml NPM_VERSION differs from ci.yml NPM_VERSION=${NPM_VERSION}"; exit 1
           fi
-      - name: Provenance verifier tests (offline fixtures)
+      - name: Release tooling tests (offline fixtures + release.yml structure)
         run: |
           set -euo pipefail
           NPM_MODULES_DIR="$(npm root -g)/npm/node_modules" node --test .github/scripts/test/*.test.cjs
