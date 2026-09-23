@@ -131,6 +131,10 @@ npm run test:integration  # needs Docker: starts greenmail/standalone automatica
 
 Integration tests start a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) container. To use an existing GreenMail instance instead, set `GREENMAIL_HOST` (and optionally `GREENMAIL_SMTP_PORT`, `GREENMAIL_IMAP_PORT`, ...).
 
+### Releasing
+
+Pushing a `v*` tag starts the Release workflow. It needs one approval (the `publish` job, `release` environment); provenance verification, dist-tag promotion and holding-tag cleanup then run automatically. A stuck, waiting or failed release does not notify anyone: after tagging, check the Actions tab until the run is green.
+
 ## License
 
 MIT
