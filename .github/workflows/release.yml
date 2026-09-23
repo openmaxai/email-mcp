@@ -28,6 +28,9 @@ env:
   # module layout is not a public npm API). Must equal NPM_VERSION in ci.yml,
   # where the verifier's fixture tests run against the same npm.
   NPM_VERSION: 10.9.7
+  # Prefix of the deprecation message set when a first publish fails
+  # provenance verification (and the only deprecation this workflow clears).
+  DEPRECATE_MARKER: 'UNVERIFIED RELEASE: npm provenance verification failed in release workflow'
 
 jobs:
   publish:
@@ -36,7 +39,7 @@ jobs:
     # Hard cap for the whole job; each step also has its own timeout. Holding
     # tag cleanup deliberately does NOT live in this job (a job-level timeout
     # or cancellation would take it down too): see the `cleanup` job.
-    timeout-minutes: 45
+    timeout-minutes: 55
     # Defense-in-depth: gate publishes behind a protected environment. Configure
     # required reviewers + a deployment tag policy on the `release` environment
     # (Settings > Environments) so every publish needs a human approval.
@@ -140,12 +143,25 @@ jobs:
       #  2. Publish (only if absent) under a neutral holding dist-tag
       #     ($HOLD_TAG), never directly under alpha/latest: `npm publish --tag X`
       #     always moves X, which would bypass the monotonic guard below.
+      #     EXCEPTION -- first-ever publish of NAME: the registry requires a
+      #     `latest` dist-tag, so it points `latest` at the first version no
+      #     matter which --tag is used (npm registry behaviour, per npm docs /
+      #     npm/cli issues; NOT live-verified by this workflow). That happens
+      #     at publish time, i.e. BEFORE step 3. The plan step warns about it;
+      #     if step 3 then fails, 3b deprecates the version (see there).
       #  3. Verify npm provenance of NAME@VERSION on the registry (BOTH paths):
       #     sigstore-verified SLSA attestation whose Fulcio cert + predicate
       #     name THIS repo, THIS workflow, THIS tag ref and EXPECTED_SHA, and
       #     whose subject digest == the registry tarball integrity; plus
-      #     `npm audit signatures` on a clean install. No provenance -> never
-      #     promote (defends against a leaked token + forged gitHead).
+      #     `npm audit signatures` on a clean install. No provenance -> this
+      #     workflow never MOVES alpha/latest (defends against a leaked token +
+      #     forged gitHead); only the registry's own first-publish `latest`
+      #     (step 2 exception) can precede it.
+      #  3b. First publish + verification failed: `npm deprecate` the version
+      #     (installers get a loud warning; `latest` cannot be removed, and
+      #     nothing is unpublished automatically). A later successful
+      #     verification (re-run) clears only a deprecation carrying this
+      #     workflow's marker.
       #  4. Move the channel tag(s) with `npm dist-tag add` ONLY if VERSION is
       #     semver-greater than what the tag points at now (so an older tag
       #     run finishing late never rolls alpha/latest back).
@@ -154,7 +170,7 @@ jobs:
       #  6. SEPARATE `cleanup` job (needs: publish, if: always()): drop the
       #     holding tag if it points at VERSION, then fail if it still exists.
       #
-      # NODE_AUTH_TOKEN is only given to the steps that write (2, 4; cleanup rm).
+      # NODE_AUTH_TOKEN is only given to the steps that write (2, 3b, 4; cleanup rm).
       # ------------------------------------------------------------------
       - name: Plan release (idempotency check)
         id: plan
@@ -214,6 +230,27 @@ jobs:
             echo "$NAME@$VERSION already on the registry claiming gitHead $EXPECTED_SHA -> skipping publish (re-run); provenance is verified next"
           fi
 
+          # 3. First-ever publish of the PACKAGE? (registry forces `latest`)
+          FIRST_PUBLISH=no
+          if [ "$ALREADY_PUBLISHED" = no ]; then
+            set +e
+            PKG_OUT="$(npm view "$NAME" name --json --prefer-online 2>"$RUNNER_TEMP/pkg.err")"
+            PKG_RC=$?
+            set -e
+            if [ "$PKG_RC" -ne 0 ]; then
+              if grep -q 'code E404' "$RUNNER_TEMP/pkg.err" || printf '%s' "$PKG_OUT" | grep -q '"code": *"E404"'; then
+                FIRST_PUBLISH=yes
+              else
+                cat "$RUNNER_TEMP/pkg.err" >&2
+                echo "::error::npm view $NAME failed (rc=$PKG_RC) with a non-404 error; refusing to guess"
+                exit 1
+              fi
+            fi
+          fi
+          if [ "$FIRST_PUBLISH" = yes ]; then
+            echo "::warning::FIRST publish of $NAME: the npm registry points 'latest' at $VERSION as soon as it is published, even with --tag $HOLD_TAG -- i.e. BEFORE provenance is verified. If verification fails, this run deprecates $NAME@$VERSION (it cannot remove 'latest')."
+          fi
+
           {
             echo "NAME=$NAME"
             echo "VERSION=$VERSION"
@@ -221,9 +258,11 @@ jobs:
             echo "NPM_MODULES_DIR=$NPM_MODULES_DIR"
             echo "SEMVER_DIR=$SEMVER_DIR"
             echo "ALREADY_PUBLISHED=$ALREADY_PUBLISHED"
+            echo "FIRST_PUBLISH=$FIRST_PUBLISH"
           } >> "$GITHUB_ENV"
 
       - name: Publish to npm (under holding dist-tag)
+        id: publish
         if: env.ALREADY_PUBLISHED != 'yes'
         timeout-minutes: 4
         run: |
@@ -234,9 +273,16 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Runs on BOTH paths (fresh publish and "already published" re-run).
-      # Nothing is promoted unless this passes.
+      # This workflow moves no dist-tag unless this passes (the registry's own
+      # first-publish `latest` is the exception, handled by 3b below).
+      # Registry propagation: the verifier retries EACH of its two registry
+      # endpoints (version manifest, attestations) up to ATTEST_ATTEMPTS times
+      # 10 s apart, i.e. up to ~80-90 s each and ~3 min worst case in total,
+      # plus the TUF fetch and the audit install below -- the step timeout
+      # covers that.
       - name: Verify npm provenance (repo + workflow + ref + commit)
-        timeout-minutes: 6
+        id: verify
+        timeout-minutes: 8
         env:
           EXPECT_REPO: openmaxai/email-mcp
           EXPECT_REPO_ID: ${{ github.repository_id }}
@@ -264,6 +310,55 @@ jobs:
             fi
             npm audit signatures
           )
+
+      # 3b. Mitigation for the first-publish situation: `latest` points at a
+      # version whose provenance did NOT verify. Decided from the registry, not
+      # from FIRST_PUBLISH, so it also covers a re-run after a run that
+      # published and then died before verifying: acts only if VERSION is the
+      # package's ONLY version and `latest` points at it (this workflow never
+      # moves `latest` before verification, so that can only be the registry's
+      # forced first-publish tag). Deprecate (reversible:
+      # `npm deprecate NAME@VERSION ""`); never unpublish automatically.
+      - name: Deprecate unverified first release (verification failed + registry-forced latest)
+        if: failure() && steps.verify.outcome == 'failure'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          STATE="$(npm view "$NAME" versions dist-tags.latest --json --prefer-online 2>/dev/null || true)"
+          FORCED="$(printf '%s' "$STATE" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let o={};try{o=JSON.parse(d)||{}}catch{}let vs=o.versions;vs=Array.isArray(vs)?vs:(vs?[vs]:[]);const v=process.argv[1];process.stdout.write(vs.length===1&&vs[0]===v&&o["dist-tags.latest"]===v?"yes":"no")})' "$VERSION")"
+          if [ "$FORCED" != yes ]; then
+            echo "not the first-publish situation (registry state: ${STATE:-<unreadable>}); no deprecation. The verification failure above already fails this run."
+            exit 0
+          fi
+          MSG="${DEPRECATE_MARKER} run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Do not use; see the repository releases."
+          for i in 1 2 3; do
+            if npm deprecate "$NAME@$VERSION" "$MSG"; then
+              echo "::error::$NAME@$VERSION was the FIRST publish, so the registry made it 'latest', but its provenance did NOT verify. It has been DEPRECATED. Investigate; if it is not genuine, unpublish it manually (npm unpublish $NAME@$VERSION) and rotate NPM_TOKEN. If it is genuine (e.g. slow attestation propagation), re-run this workflow: a successful verification clears this deprecation."
+              exit 1
+            fi
+            echo "npm deprecate failed (attempt $i), retrying..."; sleep 5
+          done
+          echo "::error::$NAME@$VERSION is 'latest' WITHOUT verified provenance and could NOT be deprecated. Deprecate or unpublish it manually NOW."
+          exit 1
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Undo only OUR deprecation (message starts with the marker) once
+      # provenance verifies, e.g. on a re-run after slow propagation.
+      - name: Clear this workflow's provenance-failure deprecation (if any)
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          DEP="$(npm view "$NAME@$VERSION" deprecated --prefer-online 2>/dev/null || true)"
+          case "$DEP" in
+            "${DEPRECATE_MARKER}"*)
+              npm deprecate "$NAME@$VERSION" ""
+              echo "cleared provenance-failure deprecation of $NAME@$VERSION (provenance now verified)" ;;
+            "") echo "$NAME@$VERSION is not deprecated" ;;
+            *) echo "::warning::$NAME@$VERSION carries a deprecation not set by this workflow; leaving it: $DEP" ;;
+          esac
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Move dist-tags (monotonic guard)
         timeout-minutes: 4
@@ -362,7 +457,7 @@ jobs:
     needs: publish
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     # Same environment as publish so NPM_TOKEN resolves whether it is a repo or
     # a `release` environment secret. Consequence: with required reviewers on
     # `release`, this job needs its own approval (approve it even when publish
