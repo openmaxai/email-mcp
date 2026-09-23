@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Integration tests (GreenMail via Docker)
+        run: npm run test:integration
+      - run: npm pack --dry-run
+
+  # Minimum-runtime gate. The dev toolchain (Vitest/Rolldown) cannot start on
+  # the oldest Node we support, so instead of running the test suite there we
+  # build + pack on Node 22 and then install ONLY the packed tarball (runtime
+  # deps, no dev toolchain) on the engines minimum and smoke-start the server.
+  # --engine-strict makes CI fail if any runtime dependency raises its own
+  # engines floor above ours. Keep MIN_NODE in sync with package.json engines.
+  min-node-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MIN_NODE: 20.19.0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Setup Node 22 (build toolchain)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check MIN_NODE matches package.json engines
+        run: |
+          ENGINES="$(node -p "require('./package.json').engines.node")"
+          if [ "$ENGINES" != ">=$MIN_NODE" ]; then
+            echo "::error::MIN_NODE=$MIN_NODE but package.json engines.node is '$ENGINES'"
+            exit 1
+          fi
+      - name: Pack tarball
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+      - name: Setup Node ${{ env.MIN_NODE }} (minimum supported runtime)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.MIN_NODE }}
+      - name: Install packed tarball and smoke-start the server
+        run: |
+          set -euo pipefail
+          node --version
+          TARBALL="$(ls "$RUNNER_TEMP"/pack/*.tgz)"
+          SMOKE_DIR="$RUNNER_TEMP/smoke"
+          mkdir -p "$SMOKE_DIR"
+          cd "$SMOKE_DIR"
+          npm init -y >/dev/null
+          npm install --engine-strict --omit=dev --no-audit --no-fund "$TARBALL"
+          node "$GITHUB_WORKSPACE/scripts/smoke-packed.mjs" node_modules/@openmaxai/email-mcp/dist/index.js
