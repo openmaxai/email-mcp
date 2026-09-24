@@ -183,7 +183,7 @@ test('CLI: the workflow marker env equals the one release.yml defines', () => {
 // --------------------------------------------- static release.yml structure
 // (full-line comments are ignored by the reader; see workflow-parse.cjs)
 
-const { parseWorkflow, needsOf } = require('./workflow-parse.cjs');
+const { parseWorkflow, needsOf, runScript } = require('./workflow-parse.cjs');
 const wf = parseWorkflow(fs.readFileSync(WORKFLOW, 'utf8'));
 
 test('workflow: job graph is publish -> verify -> promote, cleanup needs all', () => {
@@ -301,4 +301,157 @@ test('workflow: concurrency queue + monotonic guard + EXPECTED_SHA normalisation
   assert.match(wf.publish.text, /expected_sha: \$\{\{ steps\.gate\.outputs\.expected_sha \}\}/);
   assert.match(wf.verify.text, /HEAD_SHA" != "\$EXPECTED_SHA"/);
   assert.match(wf.promote.text, /s\.gt\(v,c\)/);
+});
+
+// Timeout budget: a job whose step timeouts add up to (or past) its own
+// timeout-minutes can be killed by the job timeout before its last steps
+// (e.g. verify's first-publish deprecate fallback) get to run. Conservative
+// bound: the sum of ALL step timeouts (not just the worst real path) plus a
+// margin must fit inside the job timeout, and every step must carry its own.
+const TIMEOUT_MARGIN_MIN = 3;
+const stepTimeout = (s) => {
+  const m = s.text.match(/^ {8}timeout-minutes:\s*(\d+)\s*$/m);
+  return m ? Number(m[1]) : null;
+};
+
+test('workflow: every job has timeout-minutes >= sum(step timeouts) + margin', () => {
+  const budgets = {};
+  for (const j of Object.values(wf)) {
+    const jobTimeout = Number(j.keys['timeout-minutes']);
+    assert.ok(Number.isInteger(jobTimeout) && jobTimeout > 0, `${j.name}: no job-level timeout-minutes`);
+    assert.ok(j.steps.length > 0, `${j.name}: no steps parsed`);
+    let sum = 0;
+    for (const s of j.steps) {
+      const t = stepTimeout(s);
+      assert.ok(t !== null && t > 0, `${j.name} / ${s.name || s.id}: step has no timeout-minutes`);
+      sum += t;
+    }
+    budgets[j.name] = { sum, jobTimeout };
+    assert.ok(
+      sum + TIMEOUT_MARGIN_MIN <= jobTimeout,
+      `${j.name}: step timeouts sum to ${sum} min; job timeout-minutes ${jobTimeout} leaves < ${TIMEOUT_MARGIN_MIN} min margin`,
+    );
+  }
+  // The parser must actually have seen the four release jobs.
+  assert.deepEqual(Object.keys(budgets).sort(), ['cleanup', 'promote', 'publish', 'verify']);
+});
+
+test('workflow: verify logs dist-tags after publish, read-only and non-fatal', () => {
+  const st = wf.verify.steps.find((x) => x.id === 'disttags');
+  assert.ok(st, 'no dist-tags observation step in verify');
+  const ids = wf.verify.steps.map((x) => x.id);
+  assert.ok(ids.indexOf('presence') < ids.indexOf('disttags') && ids.indexOf('disttags') < ids.indexOf('verify'),
+    'dist-tags must be logged after the presence check and before provenance verification');
+  assert.equal(st.if, "always() && steps.presence.outputs.action == 'verify'");
+  assert.equal(st.token, false, 'observation step must not reference NODE_AUTH_TOKEN');
+  assert.doesNotMatch(st.text, /NPM_TOKEN|secrets\./);
+  assert.match(st.text, /^ {8}continue-on-error: true$/m);
+  assert.match(st.text, /npm view "\$NAME" dist-tags --json/);
+  assert.match(st.text, /JSON\.stringify\(JSON\.parse\(out\)\)/);
+  assert.match(st.text, /package not visible yet/);
+  assert.doesNotMatch(st.text, /npm (dist-tag|deprecate|publish|unpublish)/);
+});
+
+// ------------------ behavioural: dist-tags observation cannot inject commands
+// The step's `run:` script is extracted from release.yml and executed the way
+// the runner does (`bash -e`, the default shell) with a fake `npm` on PATH
+// that replays hostile output. The runner parses stdout line by line (CR, LF
+// or CRLF) and URL-decodes %25 / %0D / %0A inside a command's message, so a
+// safe step prints EXACTLY ONE line, it is the step's own ::notice:: /
+// ::warning::, and its decoded message still contains no CR / LF.
+
+const os = require('node:os');
+
+function runDisttags({ rc, out, err }) {
+  const st = wf.verify.steps.find((x) => x.id === 'disttags');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'disttags-'));
+  try {
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.mkdirSync(path.join(dir, 'npm-cwd'));
+    fs.writeFileSync(path.join(dir, 'out'), out);
+    fs.writeFileSync(path.join(dir, 'err'), err);
+    fs.writeFileSync(path.join(bin, 'npm'),
+      '#!/bin/bash\nprintf "%s\\n" "$*" >> "$FAKE_DIR/argv"\ncat "$FAKE_DIR/out"\ncat "$FAKE_DIR/err" >&2\nexit "$FAKE_RC"\n',
+      { mode: 0o755 });
+    const script = path.join(dir, 'step.sh');
+    fs.writeFileSync(script, runScript(st));
+    const r = spawnSync('bash', ['-e', script], {
+      encoding: 'utf8',
+      env: {
+        PATH: `${bin}:${process.env.PATH}`, HOME: dir, FAKE_DIR: dir, FAKE_RC: String(rc),
+        NPM_CWD: path.join(dir, 'npm-cwd'), RUNNER_TEMP: dir, NAME: '@openmaxai/email-mcp',
+      },
+    });
+    return { status: r.status, stdout: r.stdout, argv: fs.readFileSync(path.join(dir, 'argv'), 'utf8') };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Workflow-command message decoding as the runner does it.
+const decodeCmd = (s) => s.replace(/%0D/g, '\r').replace(/%0A/g, '\n').replace(/%25/g, '%');
+
+function assertOneSafeLine(res, kind) {
+  assert.equal(res.status, 0, 'observation step must exit 0');
+  assert.equal(res.argv, 'view @openmaxai/email-mcp dist-tags --json --prefer-online\n');
+  const lines = res.stdout.split(/\r\n|\r|\n/).filter((l) => l !== '');
+  assert.equal(lines.length, 1, `expected exactly one output line, got ${JSON.stringify(res.stdout)}`);
+  const m = lines[0].match(/^::(notice|warning)::(.*)$/s);
+  assert.ok(m, `line is not the step's own ::notice:: / ::warning:: -- ${JSON.stringify(lines[0])}`);
+  assert.equal(m[1], kind);
+  assert.doesNotMatch(m[2], /::/, 'message must not contain a workflow-command marker');
+  assert.doesNotMatch(decodeCmd(m[2]), /[\r\n]/, 'decoded message must stay a single line');
+  return m[2];
+}
+
+const HOSTILE = [
+  'npm warn something',
+  '::error::injected-lf',
+  'x\r::error::injected-cr',
+  'y\r\n::warning::injected-crlf',
+  'literal %0A::error::injected-pct-lf and %0D::error::pct-cr and %25',
+  'sep ::error::injected-u2028 ::error::u2029',
+  '::add-mask::x',
+  '::stop-commands::tok',
+  '',
+].join('\n');
+
+test('workflow: dist-tags observation, npm exit 0 with hostile non-JSON -> one safe ::notice:: line', () => {
+  const msg = assertOneSafeLine(runDisttags({ rc: 0, out: HOSTILE, err: HOSTILE }), 'notice');
+  assert.match(msg, /^dist-tags after publish: <non-JSON: "/);
+  assert.match(msg, /injected-u2028/, 'the untrusted text is shown (escaped), not dropped');
+});
+
+test('workflow: dist-tags observation, npm exit 0 with JSON -> re-serialised one-line ::notice::', () => {
+  const out = '{\n  "latest": "0.1.0",\n  "evil": "a\\n::error::b%0A::error::c"\n}\n';
+  const msg = assertOneSafeLine(runDisttags({ rc: 0, out, err: '' }), 'notice');
+  assert.match(msg, /^dist-tags after publish: \{"latest":"0\.1\.0","evil":/);
+});
+
+test('workflow: dist-tags observation, npm non-zero with hostile stdout/stderr -> one safe ::warning:: line', () => {
+  for (const rc of [1, 2, 127]) {
+    const msg = assertOneSafeLine(runDisttags({ rc, out: HOSTILE, err: HOSTILE }), 'warning');
+    assert.equal(msg, `dist-tags after publish: npm view failed (rc=${rc})`);
+  }
+});
+
+test('workflow: dist-tags observation, npm E404 -> one ::notice:: line', () => {
+  for (const [out, err] of [['', `${E404_ERR}\n::error::x\n`], ['{\n  "error": {\n    "code": "E404"\n  }\n}\n::error::y\n', '']]) {
+    const msg = assertOneSafeLine(runDisttags({ rc: 1, out, err }), 'notice');
+    assert.equal(msg, 'dist-tags after publish: package not visible yet (E404)');
+  }
+});
+
+test('workflow: dist-tags observation keeps its escaping calls (static)', () => {
+  const sc = runScript(wf.verify.steps.find((x) => x.id === 'disttags'));
+  // esc(): cap, break `::`, and workflow-command-escape % CR LF (% first)
+  assert.match(sc, /const esc = \(s\) => String\(s\)\.slice\(0, 2000\)\.replace\(\/::\/g, ": :"\)\s*\.replace\(\/%\/g, "%25"\)\.replace\(\/\\r\/g, "%0D"\)\.replace\(\/\\n\/g, "%0A"\);/);
+  // the only untrusted value logged goes through esc(); the non-JSON fallback is JSON-quoted
+  assert.match(sc, /console\.log\("::notice::dist-tags after publish: " \+ esc\(line\)\);/);
+  assert.match(sc, /catch \{ line = "<non-JSON: " \+ JSON\.stringify\(out\) \+ ">"; \}/);
+  assert.match(sc, /"::warning::dist-tags after publish: npm view failed \(rc=" \+ esc\(rc\) \+ "\)"/);
+  // npm's exit status must be captured, not fatal under the runner's `bash -e`
+  assert.match(sc, /^TAGS_RC=0$/m);
+  assert.match(sc, /^TAGS_OUT="\$\(npm view [^\n]*\)" \|\| TAGS_RC=\$\?$/m);
 });
