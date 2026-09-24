@@ -251,6 +251,13 @@ jobs:
           if [ "$NAME" != "$EXPECT_NAME" ]; then
             echo "::error::package.json name '$NAME' is not '$EXPECT_NAME'; refusing"; exit 1
           fi
+          # npm validates provenance against package.json repository.url and
+          # rejects the publish (E422) if it does not name this repository.
+          REPO_URL="$(node -p "const r=require('./package.json').repository; (typeof r==='string'?r:(r&&r.url)||'')")"
+          REPO_NORM="$(printf '%s' "$REPO_URL" | sed -e 's#^git+##' -e 's#\.git$##')"
+          if [ "$REPO_NORM" != "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" ]; then
+            echo "::error::package.json repository.url does not match ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; npm would reject provenance"; exit 1
+          fi
           # prerelease versions (contain a hyphen, e.g. 0.1.0-alpha.3) go to the
           # `alpha` channel; stable versions go to `latest`.
           case "$VERSION" in *-*) CHANNEL=alpha ;; *) CHANNEL=latest ;; esac
