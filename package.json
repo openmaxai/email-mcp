@@ -2,6 +2,14 @@
   "name": "@openmaxai/email-mcp",
   "version": "0.1.0",
   "description": "Stdio MCP server for email: send via SMTP, read via IMAP or POP3. Works with any provider that supports app passwords / authorization codes.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmaxai/email-mcp.git"
+  },
+  "homepage": "https://github.com/openmaxai/email-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/openmaxai/email-mcp/issues"
+  },
   "type": "module",
   "bin": {
     "email-mcp": "dist/index.js"
